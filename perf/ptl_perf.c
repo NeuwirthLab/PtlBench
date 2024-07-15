@@ -140,6 +140,8 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 	p->msg_size = 1024;
 	p->min_msg_size = 0;
 	p->max_msg_size = 0;
+	p->peer.phys.nid = PTL_NID_ANY;
+	p->peer.phys.pid = PTL_PID_ANY;
 
 	while (1) {
 		const int opt = getopt_long(*argc, *argv, short_opts, long_opts, NULL);
@@ -181,8 +183,8 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 				}
 				break;
 			case 'z':
-				if (strcmp(optarg, "PINNED") == 0 ||
-				    strcmp(optarg, "pinned") == 0) {
+				if (strcmp(optarg, "FAULT") == 0 ||
+				    strcmp(optarg, "fault") == 0) {
 					p->memory_mode = PINNED;
 				}
 				else if ((strcmp(optarg, "IOVEC") == 0) ||
@@ -209,6 +211,7 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 				break;
 			case 3:
 				p->min_msg_size = atoll(optarg);
+				p->msg_size = 0;
 				break;
 			case 4:
 				p->max_msg_size = atoll(optarg);
@@ -236,23 +239,6 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 	return EXIT_SUCCESS;
 }
 
-void* ptl_malloc(size_t size) {
-	return malloc(size);
-}
-
-void ptl_free(void* ptr, size_t size) {
-	if (size > 0)
-		free(ptr);
-}
-
-void ptl_lock(void* ptr, size_t size) {
-	mlock(ptr, size);
-}
-
-void ptl_unlock(void* ptr, size_t size) {
-	munlock(ptr, size);
-}
-
 void init_ptl_ctx(ptl_ctx_t* ctx, parameter_t* p) {
 	unsigned int ni_matching =
 	    p->ni_mode == MATCHING ? PTL_NI_MATCHING : PTL_NI_NO_MATCHING;
@@ -275,19 +261,14 @@ void init_ptl_ctx(ptl_ctx_t* ctx, parameter_t* p) {
 	    .max_volatile_size = LONG_MAX,
 	    .features = PTL_TARGET_BIND_INACCESSIBLE,
 	};
-	struct ptl_mem_ops ops = {
-	    .alloc = ptl_malloc,
-	    .free = ptl_free,
-	    .lock = ptl_lock,
-	    .unlock = ptl_unlock,
-	};
-	CHECK(PtlSetMemOps(&ops));
+
 	CHECK(PtlNIInit(PTL_IFACE_DEFAULT,
 	                ni_matching | PTL_NI_PHYSICAL,
 	                PTL_PID_ANY,
 	                &ni_requested_limits,
 	                &ni_limits,
 	                &ctx->ni_h));
+
 	CHECK(PtlGetPhysId(ctx->ni_h, &ctx->p_id));
 	CHECK(PtlEQAlloc(ctx->ni_h, 1024, &ctx->eq_h));
 	CHECK(PtlCTAlloc(ctx->ni_h, &ctx->ct_h));
@@ -380,25 +361,34 @@ void get_msg(ptl_ctx_t* ctx, parameter_t* p, msg_ctx_t* m_ctx) {
 }
 
 void put_msg(ptl_ctx_t* ctx, parameter_t* p, msg_ctx_t* m_ctx) {
-	ptl_size_t test = 0;
 	ptl_ct_event_t event;
 	unsigned int which = 0;
-	ptl_size_t msg_size =
-	    p->memory_mode == IOVEC ? p->n_iovec * msg_size : msg_size;
+	ptl_size_t offset = 0;
+	ptl_size_t msg_size = m_ctx->msg_size;
 
+	switch (p->memory_mode) {
+		case FAULT:
+			offset = (ptl_size_t) m_ctx->msg_buffer;
+			break;
+		case PINNED:
+			offset = 0;
+			break;
+	}
+	ptl_size_t nr = p->warmup;
 	for (int w = 0; w < p->warmup; ++w) {
 		CHECK(PtlPut(m_ctx->md_h,
-		             0,
+		             offset,
 		             msg_size,
 		             PTL_CT_ACK_REQ,
 		             m_ctx->peer,
 		             DESIRED_PT_IDX,
-		             0,
+		             offset,
 		             0,
 		             NULL,
 		             0));
 	}
-	CHECK(PtlCTPoll(&ctx->ct_h, &test, 1, PTL_TIME_FOREVER, &event, &which));
+
+	CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 	if (event.failure > 0) {
 		fprintf(stderr, "put_msg failed \n");
 		return;
@@ -406,19 +396,19 @@ void put_msg(ptl_ctx_t* ctx, parameter_t* p, msg_ctx_t* m_ctx) {
 
 	if (p->type == LATENCY) {
 		for (int i = 0; i < p->iterations; ++i) {
+			nr += 1;
 			double t0 = get_wtime();
 			CHECK(PtlPut(m_ctx->md_h,
-			             0,
+			             offset,
 			             msg_size,
 			             PTL_CT_ACK_REQ,
 			             m_ctx->peer,
 			             DESIRED_PT_IDX,
-			             0,
+			             offset,
 			             0,
 			             NULL,
 			             0));
-			CHECK(PtlCTPoll(
-			    &ctx->ct_h, &test, 1, PTL_TIME_FOREVER, &event, &which));
+			CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 			m_ctx->timings[i] = get_wtime() - t0;
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
@@ -427,23 +417,24 @@ void put_msg(ptl_ctx_t* ctx, parameter_t* p, msg_ctx_t* m_ctx) {
 		}
 	}
 	else {
-		for (int i = 0; i < p->iterations; ++i) {
+		nr += p->window_size;
+		for (int i = 0; i < p->iterations; ++i, nr += p->window_size) {
 			double t0 = get_wtime();
 			for (int w = 0; w < p->window_size; ++w) {
 				CHECK(PtlPut(m_ctx->md_h,
-				             0,
+				             offset,
 				             msg_size,
 				             PTL_CT_ACK_REQ,
 				             m_ctx->peer,
 				             DESIRED_PT_IDX,
-				             0,
+				             offset,
 				             0,
 				             NULL,
 				             0));
 			}
-			CHECK(PtlCTPoll(
-			    &ctx->ct_h, &test, 1, PTL_TIME_FOREVER, &event, &which));
+			CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 			m_ctx->timings[i] = get_wtime() - t0;
+
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
 				return;
@@ -452,19 +443,26 @@ void put_msg(ptl_ctx_t* ctx, parameter_t* p, msg_ctx_t* m_ctx) {
 	}
 }
 
-void print_result(parameter_t* p, msg_ctx_t* m_ctx) {
+void print_header(parameter_t* p) {
 	if (LATENCY == p->type) {
 		printf("ID\tmsg_size\tlatency\n");
-		for (int i = 0; i < p->iterations; ++i) {
-			printf("%i\t%lu\t%f\n", i, m_ctx->msg_size, m_ctx->timings[i]);
-		}
 	}
 	else {
 		printf("ID\tmsg_size\tbandwidth\n");
+	}
+}
+
+void print_result(parameter_t* p, msg_ctx_t* m_ctx) {
+	if (LATENCY == p->type) {
+		for (int i = 0; i < p->iterations; ++i) {
+			printf("%i\t%lu\t%.4f\n", i, m_ctx->msg_size, m_ctx->timings[i]);
+		}
+	}
+	else {
 		for (int i = 0; i < p->iterations; ++i) {
 			double bw = (m_ctx->msg_size * p->window_size * 1e-6) /
 			            (m_ctx->timings[i] * 1e-9);
-			printf("%i\t%lu\t%f\n", i, m_ctx->msg_size, bw);
+			printf("%i\t%lu\t%.4f\n", i, m_ctx->msg_size, bw);
 		}
 	}
 }
@@ -504,11 +502,14 @@ int run_client(parameter_t* p) {
 			options |= PTL_IOVEC;
 			break;
 	}
-	options |= PTL_MD_VOLATILE | PTL_MD_EVENT_SUCCESS_DISABLE |
-	           PTL_MD_EVENT_CT_REPLY | PTL_MD_EVENT_CT_ACK;
+
+	options = PTL_MD_VOLATILE | PTL_MD_EVENT_SUCCESS_DISABLE |
+	          PTL_MD_EVENT_CT_ACK | PTL_MD_EVENT_CT_REPLY;
+
 	md.options = options;
 	md.ct_handle = ctx.ct_h;
 	md.eq_handle = PTL_EQ_NONE;
+
 	CHECK(PtlMDBind(ctx.ni_h, &md, &md_h));
 
 	msg_ctx_t m_ctx;
@@ -518,6 +519,7 @@ int run_client(parameter_t* p) {
 	m_ctx.md_h = md_h;
 	m_ctx.peer = p->peer;
 
+	print_header(p);
 	if (p->op == PUT) {
 		if (p->msg_size) {
 			put_msg(&ctx, p, &m_ctx);
@@ -526,6 +528,10 @@ int run_client(parameter_t* p) {
 		else if (p->min_msg_size && p->max_msg_size) {
 			for (ptl_size_t m = p->min_msg_size; m <= p->max_msg_size; m *= 2) {
 				m_ctx.msg_size = m;
+				if (m > bytes) {
+					fprintf(stderr, "Invalid msg size\n");
+					goto END;
+				}
 				put_msg(&ctx, p, &m_ctx);
 				print_result(p, &m_ctx);
 			}
@@ -544,6 +550,24 @@ int run_client(parameter_t* p) {
 			}
 		}
 	}
+END:
+	if (!PtlHandleIsEqual(md_h, PTL_INVALID_HANDLE)) {
+		CHECK(PtlMDRelease(md_h));
+	}
+	if (NULL != msg_buffer) {
+		free_pinned_memory(msg_buffer, bytes);
+	}
+	if (IOVEC == p->memory_mode) {
+		for (int i = 0; i < p->n_iovec; ++i) {
+			free_pinned_memory(iovecs[i].iov_base, iovecs[i].iov_len);
+		}
+	}
+	if (NULL != m_ctx.timings) {
+		free(m_ctx.timings);
+	}
+
+	destroy_ptl_ctx(&ctx);
+	PtlFini();
 }
 
 int run_server(parameter_t* p) {
@@ -576,6 +600,8 @@ int run_server(parameter_t* p) {
 			options |= PTL_ME_IS_ACCESSIBLE;
 		}
 		else if (FAULT == p->memory_mode) {
+			msg_buffer = alloc_pinned_memory(bytes);
+			me.start = msg_buffer;
 			me.start = NULL;
 			me.length = PTL_SIZE_MAX;
 		}
@@ -615,6 +641,7 @@ int run_server(parameter_t* p) {
 			options |= PTL_LE_IS_ACCESSIBLE;
 		}
 		else if (FAULT == p->memory_mode) {
+			msg_buffer = alloc_pinned_memory(bytes);
 			le.start = NULL;
 			le.length = PTL_SIZE_MAX;
 		}
@@ -648,7 +675,8 @@ int run_server(parameter_t* p) {
 
 	char input[256];
 
-	printf("Server is ready and running. Type 'exit' to quit.\n");
+	printf("Server is ready and running PT idx is %i. Type 'exit' to quit.\n",
+	       pt_idx);
 
 	while (1) {
 		printf("Enter command: ");
