@@ -10,7 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DESIRED_PT_IDX 0
+#define DATA_PT_IDX 0
+#define CMD_PT_IDX 1
 #define CHECK(stmt)                                       \
 	do {                                                  \
 		int ret = (stmt);                                 \
@@ -27,7 +28,7 @@
 
 typedef enum { MATCHING = 0, NON_MATCHING } ni_mode_t;
 typedef enum { CLIENT = 0, SERVER } benchmark_role_t;
-typedef enum { LATENCY = 0, BANDWIDTH } benchmark_type_t;
+typedef enum { LATENCY = 0, BANDWIDTH, MSGRATE } benchmark_type_t;
 typedef enum { PUT = 0, GET } operation_t;
 typedef enum { PINNED = 0, FAULT, IOVEC, IOVEC_BIDIR } memory_mode_t;
 
@@ -51,17 +52,25 @@ typedef struct {
 typedef struct {
 	ptl_handle_ni_t ni_h;
 	ptl_handle_eq_t eq_h;
+	ptl_handle_eq_t cmd_eq_h;
 	ptl_handle_ct_t ct_h;
+	ptl_handle_ct_t cmd_ct_h;
 	ptl_handle_md_t md_h;
+	ptl_handle_md_t cmd_md_h;
 	ptl_handle_le_t le_h;
+	ptl_handle_le_t cmd_le_h;
 	ptl_handle_me_t me_h;
 	ptl_pt_index_t pt_idx;
+	ptl_pt_index_t cmd_pt_idx;
 	ptl_iovec_t iovecs[256];
 	ptl_size_t n_iovecs;
 	void* msg_buffer;
+	void* cmd_buffer;
 	ptl_size_t buffer_len;
+	ptl_size_t cmd_len;
 	ptl_process_t p_id;
 	ptl_process_t peer;
+	ptl_size_t peer_offset;
 } ptl_ctx_t;
 
 double get_wtime() {
@@ -173,22 +182,26 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 				break;
 			case 't':
 				if ((strcmp(optarg, "BANDWIDTH") == 0) ||
-				    (strcmp(optarg, "bandwidth")) == 0) {
+				    (strcmp(optarg, "bandwidth") == 0)) {
 					p->type = BANDWIDTH;
+				}
+				else if ((strcmp(optarg, "MSGRATE") == 0) ||
+				         (strcmp(optarg, "msgrate") == 0)) {
+					p->type = MSGRATE;
 				}
 				else {
 					print_help();
-					return EXIT_FAILURE;
+					exit(EXIT_FAILURE);
 				}
 				break;
 			case 'o':
 				if ((strcmp(optarg, "GET") == 0) ||
-				    (strcmp(optarg, "get")) == 0) {
+				    (strcmp(optarg, "get") == 0)) {
 					p->op = GET;
 				}
 				else {
 					print_help();
-					return EXIT_FAILURE;
+					exit(EXIT_FAILURE);
 				}
 				break;
 			case 'z':
@@ -206,7 +219,7 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 				}
 				else {
 					print_help();
-					return EXIT_FAILURE;
+					exit(EXIT_FAILURE);
 				}
 				break;
 			case 0:
@@ -236,13 +249,13 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 				break;
 			case 'h':
 				print_help();
-				return EXIT_SUCCESS;
+				exit(EXIT_SUCCESS);
 			case '?':
 				print_help();
-				return EXIT_FAILURE;
+				exit(EXIT_FAILURE);
 			default:
 				print_help();
-				return EXIT_FAILURE;
+				exit(EXIT_FAILURE);
 		}
 	}
 	return EXIT_SUCCESS;
@@ -300,7 +313,7 @@ void destroy_ptl_ctx(ptl_ctx_t* ctx) {
 	if (!PtlHandleIsEqual(ctx->le_h, PTL_INVALID_HANDLE)) {
 		CHECK(PtlLEUnlink(ctx->le_h));
 	}
-	if (!PtlHandleIsEqual(ctx->le_h, PTL_INVALID_HANDLE)) {
+	if (!PtlHandleIsEqual(ctx->me_h, PTL_INVALID_HANDLE)) {
 		CHECK(PtlMEUnlink(ctx->me_h));
 	}
 	if (PTL_PT_ANY != ctx->pt_idx) {
@@ -318,9 +331,22 @@ void destroy_ptl_ctx(ptl_ctx_t* ctx) {
 }
 
 void* alloc_pinned_memory(size_t bytes) {
-	void* ptr = malloc(bytes);
+	void* ptr = NULL;
+	size_t alignment = sysconf(_SC_PAGESIZE);
+	posix_memalign(&ptr, alignment, bytes);
 	mlock(ptr, bytes);
 	return ptr;
+}
+
+void* alloc_memory(size_t bytes) {
+	void* ptr = NULL;
+	size_t alignment = sysconf(_SC_PAGESIZE);
+	posix_memalign(&ptr, alignment, bytes);
+	return ptr;
+}
+
+void free_memory(void* ptr) {
+	free(ptr);
 }
 
 void free_pinned_memory(void* ptr, size_t size) {
@@ -333,13 +359,21 @@ void get_msg(ptl_ctx_t* ctx,
              const ptl_size_t msg_size,
              double* timings) {
 	ptl_ct_event_t event;
-	const ptl_size_t offset =
+	const ptl_size_t local_offset =
 	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
+	const ptl_size_t remote_offset =
+	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
 
 	ptl_size_t nr = p->warmup;
 	for (int w = 0; w < p->warmup; ++w) {
-		CHECK(PtlGet(
-		    ctx->md_h, 0, msg_size, ctx->peer, DESIRED_PT_IDX, 0, 0, NULL));
+		CHECK(PtlGet(ctx->md_h,
+		             local_offset,
+		             msg_size,
+		             ctx->peer,
+		             DATA_PT_IDX,
+		             remote_offset,
+		             0,
+		             NULL));
 	}
 	CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 	if (event.failure > 0) {
@@ -347,32 +381,37 @@ void get_msg(ptl_ctx_t* ctx,
 		return;
 	}
 
-	if (p->type == LATENCY) {
-
+	if (LATENCY == p->type) {
 		for (int i = 0; i < p->iterations; ++i, ++nr) {
 			double t0 = get_wtime();
-			CHECK(PtlGet(
-			    ctx->md_h, 0, msg_size, ctx->peer, DESIRED_PT_IDX, 0, 0, NULL));
+			CHECK(PtlGet(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL));
 			CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 			timings[i] = get_wtime() - t0;
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
-				return;
+				exit(EXIT_FAILURE);
 			}
 		}
 	}
-	else {
+	else if (BANDWIDTH == p->type) {
 		nr += p->window_size;
 		for (int i = 0; i < p->iterations; ++i, nr += p->window_size) {
 			double t0 = get_wtime();
 			for (int w = 0; w < p->warmup; ++w) {
 				for (int w = 0; w < p->window_size; ++w) {
 					CHECK(PtlGet(ctx->md_h,
-					             0,
+					             local_offset,
 					             msg_size,
 					             ctx->peer,
-					             DESIRED_PT_IDX,
-					             0,
+					             DATA_PT_IDX,
+					             remote_offset,
 					             0,
 					             NULL));
 				}
@@ -381,8 +420,28 @@ void get_msg(ptl_ctx_t* ctx,
 			timings[i] = get_wtime() - t0;
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
-				return;
+				exit(EXIT_FAILURE);
 			}
+		}
+	}
+	else if (MSGRATE == p->type) {
+		nr += p->iterations;
+		for (int i = 0; i < p->iterations; ++i) {
+			double t0 = get_wtime();
+			CHECK(PtlGet(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL));
+			timings[i] = get_wtime() - t0;
+		}
+		CHECK(PtlCTWait(ctx->ct_h, nr, &event));
+		if (event.failure > 0) {
+			fprintf(stderr, "put_msg failed\n");
+			exit(EXIT_FAILURE);
 		}
 	}
 }
@@ -392,18 +451,20 @@ void put_msg(ptl_ctx_t* ctx,
              const ptl_size_t msg_size,
              double* timings) {
 	ptl_ct_event_t event;
-	const ptl_size_t offset =
+	const ptl_size_t local_offset =
 	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
+	const ptl_size_t remote_offset =
+	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
 
 	ptl_size_t nr = p->warmup;
 	for (int w = 0; w < p->warmup; ++w) {
 		CHECK(PtlPut(ctx->md_h,
-		             offset,
+		             local_offset,
 		             msg_size,
 		             PTL_CT_ACK_REQ,
 		             ctx->peer,
-		             DESIRED_PT_IDX,
-		             offset,
+		             DATA_PT_IDX,
+		             remote_offset,
 		             0,
 		             NULL,
 		             0));
@@ -412,19 +473,19 @@ void put_msg(ptl_ctx_t* ctx,
 	CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 	if (event.failure > 0) {
 		fprintf(stderr, "put_msg failed \n");
-		return;
+		exit(EXIT_FAILURE);
 	}
 
-	if (p->type == LATENCY) {
+	if (LATENCY == p->type) {
 		for (int i = 0; i < p->iterations; ++i, ++nr) {
 			double t0 = get_wtime();
 			CHECK(PtlPut(ctx->md_h,
-			             offset,
+			             local_offset,
 			             msg_size,
 			             PTL_CT_ACK_REQ,
 			             ctx->peer,
-			             DESIRED_PT_IDX,
-			             offset,
+			             DATA_PT_IDX,
+			             remote_offset,
 			             0,
 			             NULL,
 			             0));
@@ -432,33 +493,54 @@ void put_msg(ptl_ctx_t* ctx,
 			timings[i] = get_wtime() - t0;
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
-				return;
+				exit(EXIT_FAILURE);
 			}
 		}
 	}
-	else {
+	else if (BANDWIDTH == p->type) {
 		nr += p->window_size;
 		for (int i = 0; i < p->iterations; ++i, nr += p->window_size) {
 			double t0 = get_wtime();
 			for (int w = 0; w < p->window_size; ++w) {
 				CHECK(PtlPut(ctx->md_h,
-				             offset,
+				             local_offset,
 				             msg_size,
 				             PTL_CT_ACK_REQ,
 				             ctx->peer,
-				             DESIRED_PT_IDX,
-				             offset,
+				             DATA_PT_IDX,
+				             remote_offset,
 				             0,
 				             NULL,
 				             0));
 			}
 			CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 			timings[i] = get_wtime() - t0;
-
 			if (event.failure > 0) {
 				fprintf(stderr, "put_msg failed\n");
-				return;
+				exit(EXIT_FAILURE);
 			}
+		}
+	}
+	else if (MSGRATE == p->type) {
+		nr += p->iterations;
+		for (int i = 0; i < p->iterations; ++i) {
+			double t0 = get_wtime();
+			CHECK(PtlPut(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             PTL_CT_ACK_REQ,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL,
+			             0));
+			timings[i] = get_wtime() - t0;
+		}
+		CHECK(PtlCTWait(ctx->ct_h, nr, &event));
+		if (event.failure > 0) {
+			fprintf(stderr, "put_msg failed\n");
+			exit(EXIT_FAILURE);
 		}
 	}
 }
@@ -473,7 +555,7 @@ void print_header(parameter_t* p) {
 }
 
 void print_result(parameter_t* p, const ptl_size_t msg_size, double* timings) {
-	if (LATENCY == p->type) {
+	if ((LATENCY == p->type) || (MSGRATE == p->type)) {
 		for (int i = 0; i < p->iterations; ++i) {
 			printf("%i\t%lu\t%.4f\n", i, msg_size, timings[i]);
 		}
@@ -487,11 +569,96 @@ void print_result(parameter_t* p, const ptl_size_t msg_size, double* timings) {
 	}
 }
 
+void setup_cmd_channel(ptl_ctx_t* ctx) {
+	ptl_le_t le;
+	ptl_event_t event;
+
+	CHECK(PtlEQAlloc(ctx->ni_h, 1024, &ctx->cmd_eq_h));
+	CHECK(PtlCTAlloc(ctx->ni_h, &ctx->cmd_ct_h));
+	CHECK(
+	    PtlPTAlloc(ctx->ni_h, 0, ctx->cmd_eq_h, CMD_PT_IDX, &ctx->cmd_pt_idx));
+
+	ctx->cmd_buffer = alloc_pinned_memory(sizeof(ptl_size_t));
+	ctx->cmd_len = sizeof(ptl_size_t);
+
+	le.start = ctx->cmd_buffer;
+	le.length = ctx->cmd_len;
+	le.ct_handle = PTL_CT_NONE;
+	le.uid = PTL_UID_ANY;
+	le.options =
+	    PTL_LE_OP_PUT | PTL_LE_IS_ACCESSIBLE | PTL_LE_EVENT_UNLINK_DISABLE;
+
+	CHECK(PtlLEAppend(
+	    ctx->ni_h, CMD_PT_IDX, &le, PTL_PRIORITY_LIST, NULL, &ctx->cmd_le_h));
+	CHECK(PtlEQWait(ctx->cmd_eq_h, &event));
+
+	if (PTL_EVENT_LINK != event.type) {
+		fprintf(stderr, "Failed to link LE\n");
+		exit(EXIT_FAILURE);
+	}
+	if (PTL_NI_OK != event.ni_fail_type) {
+		fprintf(stderr, "ni_fail_type != PTL_NI_OK");
+		exit(EXIT_FAILURE);
+	}
+
+	ptl_md_t md;
+	md.start = NULL;
+	md.length = PTL_SIZE_MAX;
+	md.options =
+	    PTL_MD_VOLATILE | PTL_MD_EVENT_SUCCESS_DISABLE | PTL_MD_EVENT_CT_ACK;
+	md.ct_handle = ctx->cmd_ct_h;
+	md.eq_handle = PTL_EQ_NONE;
+
+	CHECK(PtlMDBind(ctx->ni_h, &md, &ctx->cmd_md_h));
+}
+
+void destroy_cmd_channel(ptl_ctx_t* ctx) {
+	CHECK(PtlLEUnlink(ctx->cmd_le_h));
+	CHECK(PtlMDRelease(ctx->cmd_md_h));
+	CHECK(PtlCTFree(ctx->cmd_ct_h));
+	CHECK(PtlEQFree(ctx->cmd_eq_h));
+	CHECK(PtlPTFree(ctx->ni_h, ctx->cmd_pt_idx));
+	free_pinned_memory(ctx->cmd_buffer, ctx->cmd_len);
+}
+
+void send_cmd(ptl_ctx_t* ctx, void* cmd, ptl_size_t len) {
+	ptl_ct_event_t event;
+	CHECK(PtlPut(ctx->cmd_md_h,
+	             (ptl_size_t) cmd,
+	             len,
+	             PTL_CT_ACK_REQ,
+	             ctx->peer,
+	             CMD_PT_IDX,
+	             0,
+	             0,
+	             NULL,
+	             0));
+	CHECK(PtlCTWait(ctx->cmd_ct_h, 1, &event));
+	if (event.failure > 0) {
+		fprintf(stderr, "Failed to send cmd\n");
+		exit(EXIT_FAILURE);
+	}
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
+	CHECK(PtlCTSet(ctx->cmd_ct_h, zero));
+}
+
+ptl_size_t receive_cmd(ptl_ctx_t* ctx) {
+	ptl_event_t event;
+	CHECK(PtlEQWait(ctx->cmd_eq_h, &event));
+	if (PTL_NI_OK != event.ni_fail_type) {
+		fprintf(stderr, "Failed to recveive cmd\n");
+		exit(EXIT_FAILURE);
+	}
+	ctx->peer = event.initiator;
+	return event.mlength;
+}
+
 int run_client(parameter_t* p) {
 	ptl_ctx_t ctx;
 
 	CHECK(PtlInit());
 	init_ptl_ctx(&ctx, p);
+	setup_cmd_channel(&ctx);
 
 	ctx.peer = p->peer;
 	ctx.buffer_len = p->msg_size ? p->msg_size : p->max_msg_size;
@@ -505,7 +672,7 @@ int run_client(parameter_t* p) {
 			md.length = ctx.buffer_len;
 			break;
 		case FAULT:
-			ctx.msg_buffer = alloc_pinned_memory(ctx.buffer_len);
+			ctx.msg_buffer = alloc_memory(ctx.buffer_len);
 			md.start = NULL;
 			md.length = PTL_SIZE_MAX;
 			break;
@@ -531,6 +698,11 @@ int run_client(parameter_t* p) {
 	CHECK(PtlMDBind(ctx.ni_h, &md, &ctx.md_h));
 
 	double* timings = malloc(p->iterations * sizeof(double));
+
+	send_cmd(&ctx, "i", sizeof(char));
+	ptl_size_t rc = receive_cmd(&ctx);
+	ctx.peer_offset = *((ptl_size_t*) ctx.cmd_buffer);
+	printf("peer_offset: %lu\n", ctx.peer_offset);
 
 	print_header(p);
 
@@ -564,7 +736,12 @@ int run_client(parameter_t* p) {
 	}
 END:
 	if (NULL != ctx.msg_buffer) {
-		free_pinned_memory(ctx.msg_buffer, ctx.buffer_len);
+		if (FAULT == p->memory_mode) {
+			free_memory(ctx.msg_buffer);
+		}
+		else if (PINNED == p->memory_mode) {
+			free_pinned_memory(ctx.msg_buffer, ctx.buffer_len);
+		}
 	}
 	if (IOVEC == p->memory_mode) {
 		for (int i = 0; i < p->n_iovec; ++i) {
@@ -574,7 +751,7 @@ END:
 	if (NULL != timings) {
 		free(timings);
 	}
-
+	destroy_cmd_channel(&ctx);
 	destroy_ptl_ctx(&ctx);
 	PtlFini();
 }
@@ -584,12 +761,13 @@ int run_server(parameter_t* p) {
 
 	CHECK(PtlInit());
 	init_ptl_ctx(&ctx, p);
+	setup_cmd_channel(&ctx);
 
 	printf("Client phys_pid: %lu\nClient phys.nid: %lu\n\n",
 	       ctx.p_id.phys.pid,
 	       ctx.p_id.phys.nid);
 
-	CHECK(PtlPTAlloc(ctx.ni_h, 0, ctx.eq_h, DESIRED_PT_IDX, &ctx.pt_idx));
+	CHECK(PtlPTAlloc(ctx.ni_h, 0, ctx.eq_h, DATA_PT_IDX, &ctx.pt_idx));
 
 	ctx.buffer_len = p->msg_size ? p->msg_size : p->max_msg_size;
 	unsigned int options = 0;
@@ -625,7 +803,7 @@ int run_server(parameter_t* p) {
 		me.ct_handle = PTL_CT_NONE;
 
 		CHECK(PtlMEAppend(
-		    ctx.ni_h, DESIRED_PT_IDX, &me, PTL_PRIORITY_LIST, NULL, &ctx.me_h));
+		    ctx.ni_h, DATA_PT_IDX, &me, PTL_PRIORITY_LIST, NULL, &ctx.me_h));
 		CHECK(PtlEQWait(ctx.eq_h, &event));
 
 		if (PTL_EVENT_LINK != event.type) {
@@ -666,7 +844,7 @@ int run_server(parameter_t* p) {
 		le.ct_handle = PTL_CT_NONE;
 
 		CHECK(PtlLEAppend(
-		    ctx.ni_h, DESIRED_PT_IDX, &le, PTL_PRIORITY_LIST, NULL, &ctx.le_h));
+		    ctx.ni_h, DATA_PT_IDX, &le, PTL_PRIORITY_LIST, NULL, &ctx.le_h));
 		CHECK(PtlEQWait(ctx.eq_h, &event));
 
 		if (PTL_EVENT_LINK != event.type) {
@@ -680,6 +858,18 @@ int run_server(parameter_t* p) {
 	}
 
 	char input[256];
+
+	ptl_size_t cmd_len = receive_cmd(&ctx);
+	if (sizeof(char) == cmd_len) {
+		printf("Server: Received msg %c\n", ((char*) ctx.cmd_buffer)[0]);
+		ptl_size_t addr = (ptl_size_t) ctx.msg_buffer;
+		printf("Server: Transmitting offset %lu to client\n", addr);
+		send_cmd(&ctx, (void*) &addr, sizeof(ptl_size_t));
+	}
+	else {
+		fprintf(stderr, "Server received wrong cmd\n");
+		goto END;
+	}
 
 	printf("Server is ready and running PT idx is %i. Type 'exit' to quit.\n",
 	       ctx.pt_idx);
@@ -699,13 +889,19 @@ int run_server(parameter_t* p) {
 	}
 END:
 	if (NULL != ctx.msg_buffer) {
-		free_pinned_memory(ctx.msg_buffer, ctx.buffer_len);
+		if (FAULT == p->memory_mode) {
+			free_memory(ctx.msg_buffer);
+		}
+		else if (PINNED == p->memory_mode) {
+			free_pinned_memory(ctx.msg_buffer, ctx.buffer_len);
+		}
 	}
 	if (IOVEC == p->memory_mode) {
 		for (int i = 0; i < p->n_iovec; ++i) {
 			free_pinned_memory(ctx.iovecs[i].iov_base, ctx.iovecs[i].iov_len);
 		}
 	}
+	destroy_cmd_channel(&ctx);
 	destroy_ptl_ctx(&ctx);
 	PtlFini();
 	return EXIT_SUCCESS;
