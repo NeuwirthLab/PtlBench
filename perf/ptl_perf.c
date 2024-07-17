@@ -12,6 +12,7 @@
 
 #define DATA_PT_IDX 0
 #define CMD_PT_IDX 1
+
 #define CHECK(stmt)                                       \
 	do {                                                  \
 		int ret = (stmt);                                 \
@@ -31,6 +32,7 @@ typedef enum { CLIENT = 0, SERVER } benchmark_role_t;
 typedef enum { LATENCY = 0, BANDWIDTH, MSGRATE } benchmark_type_t;
 typedef enum { PUT = 0, GET } operation_t;
 typedef enum { PINNED = 0, FAULT, IOVEC, IOVEC_BIDIR } memory_mode_t;
+typedef enum { CT_EVENT = 0, FULL_EVENT } event_type_t;
 
 typedef struct {
 	ni_mode_t ni_mode;
@@ -38,6 +40,7 @@ typedef struct {
 	benchmark_type_t type;
 	operation_t op;
 	memory_mode_t memory_mode;
+	event_type_t event_type;
 	int iterations;
 	int warmup;
 	int window_size;
@@ -53,6 +56,7 @@ typedef struct {
 	ptl_handle_ni_t ni_h;
 	ptl_handle_eq_t eq_h;
 	ptl_handle_eq_t cmd_eq_h;
+	ptl_handle_eq_t md_eq_h;
 	ptl_handle_ct_t ct_h;
 	ptl_handle_ct_t cmd_ct_h;
 	ptl_handle_md_t md_h;
@@ -141,9 +145,10 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 	    {"pid", required_argument, NULL, 5},
 	    {"nid", required_argument, NULL, 6},
 	    {"window-size", required_argument, NULL, 7},
+	    {"event", no_argument, NULL, 'e'},
 	    {"help", no_argument, NULL, 'h'}};
 
-	const char* const short_opts = "mct:o:z:i:w:h";
+	const char* const short_opts = "mct:o:z:i:w:he";
 
 	p->ni_mode = NON_MATCHING;
 	p->role = SERVER;
@@ -160,6 +165,7 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 	p->max_msg_size = 0;
 	p->peer.phys.nid = PTL_NID_ANY;
 	p->peer.phys.pid = PTL_PID_ANY;
+	p->event_type = CT_EVENT;
 
 	while (1) {
 		const int opt = getopt_long(*argc, *argv, short_opts, long_opts, NULL);
@@ -193,6 +199,9 @@ int get_cmdline_opts(int* argc, char*** argv, parameter_t* p) {
 					print_help();
 					exit(EXIT_FAILURE);
 				}
+				break;
+			case 'e':
+				p->event_type = FULL_EVENT;
 				break;
 			case 'o':
 				if ((strcmp(optarg, "GET") == 0) ||
@@ -288,6 +297,7 @@ void init_ptl_ctx(ptl_ctx_t* ctx, parameter_t* p) {
 	ctx->le_h = PTL_INVALID_HANDLE;
 	ctx->me_h = PTL_INVALID_HANDLE;
 	ctx->eq_h = PTL_INVALID_HANDLE;
+	ctx->md_eq_h = PTL_INVALID_HANDLE;
 	ctx->ct_h = PTL_INVALID_HANDLE;
 	ctx->ni_h = PTL_INVALID_HANDLE;
 	ctx->pt_idx = PTL_PT_ANY;
@@ -302,7 +312,8 @@ void init_ptl_ctx(ptl_ctx_t* ctx, parameter_t* p) {
 	                &ctx->ni_h));
 
 	CHECK(PtlGetPhysId(ctx->ni_h, &ctx->p_id));
-	CHECK(PtlEQAlloc(ctx->ni_h, 1024, &ctx->eq_h));
+	CHECK(PtlEQAlloc(ctx->ni_h, 4096, &ctx->eq_h));
+	CHECK(PtlEQAlloc(ctx->ni_h, 4096, &ctx->md_eq_h));
 	CHECK(PtlCTAlloc(ctx->ni_h, &ctx->ct_h));
 }
 
@@ -322,6 +333,10 @@ void destroy_ptl_ctx(ptl_ctx_t* ctx) {
 	if (!PtlHandleIsEqual(ctx->eq_h, PTL_INVALID_HANDLE)) {
 		CHECK(PtlEQFree(ctx->eq_h));
 	}
+	if (!PtlHandleIsEqual(ctx->md_eq_h, PTL_INVALID_HANDLE)) {
+		CHECK(PtlEQFree(ctx->md_eq_h));
+	}
+
 	if (!PtlHandleIsEqual(ctx->ct_h, PTL_INVALID_HANDLE)) {
 		CHECK(PtlCTFree(ctx->ct_h));
 	}
@@ -335,7 +350,7 @@ void* alloc_pinned_memory(size_t bytes) {
 	size_t alignment = sysconf(_SC_PAGESIZE);
 	posix_memalign(&ptr, alignment, bytes);
 	mlock(ptr, bytes);
-	memset(ptr,'c',bytes);
+	memset(ptr, 'c', bytes);
 	return ptr;
 }
 
@@ -343,7 +358,7 @@ void* alloc_memory(size_t bytes) {
 	void* ptr = NULL;
 	size_t alignment = sysconf(_SC_PAGESIZE);
 	posix_memalign(&ptr, alignment, bytes);
-	memset(ptr,'c',bytes);
+	memset(ptr, 'c', bytes);
 	return ptr;
 }
 
@@ -355,20 +370,19 @@ void free_pinned_memory(void* ptr, size_t size) {
 	free(ptr);
 }
 
-void get_msg(ptl_ctx_t* ctx,
-             parameter_t* p,
-             const ptl_size_t msg_size,
-             double* timings) {
-	ptl_ct_event_t event;
+void get_msg_event(ptl_ctx_t* ctx,
+                   parameter_t* p,
+                   const ptl_size_t msg_size,
+                   double* timings) {
+	ptl_event_t event;
 	const ptl_size_t local_offset =
 	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
 	const ptl_size_t remote_offset =
 	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
-	ptl_size_t nr = 0;
 
 	if (LATENCY == p->type) {
 		double t0 = 0;
-		for (int i = 0; i < p->iterations + p->warmup; ++i, ++nr) {
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
 			}
@@ -380,6 +394,100 @@ void get_msg(ptl_ctx_t* ctx,
 			             remote_offset,
 			             0,
 			             NULL));
+			CHECK(PtlEQWait(ctx->md_eq_h, &event));
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "put_msg failed\n");
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+	else if (BANDWIDTH == p->type) {
+		double t0 = 0;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			for (int w = 0; w < p->window_size; ++w) {
+				CHECK(PtlGet(ctx->md_h,
+				             local_offset,
+				             msg_size,
+				             ctx->peer,
+				             DATA_PT_IDX,
+				             remote_offset,
+				             0,
+				             NULL));
+			}
+
+			for (int u = 0; u < p->window_size; ++u) {
+				CHECK(PtlEQWait(ctx->md_eq_h, &event));
+				if (PTL_NI_OK != event.ni_fail_type) {
+					fprintf(stderr, "put_msg failed\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+		}
+	}
+	else if (MSGRATE == p->type) {
+		double t0 = 0;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			CHECK(PtlGet(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL));
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+		}
+		for (int u = 0; u < p->iterations + p->warmup; ++u) {
+			CHECK(PtlEQWait(ctx->md_eq_h, &event));
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "put_msg failed\n");
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+}
+
+void get_msg(ptl_ctx_t* ctx,
+             parameter_t* p,
+             const ptl_size_t msg_size,
+             double* timings) {
+	ptl_ct_event_t event;
+	const ptl_size_t local_offset =
+	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
+	const ptl_size_t remote_offset =
+	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
+
+	if (LATENCY == p->type) {
+		double t0 = 0;
+		ptl_size_t nr = 0;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			CHECK(PtlGet(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL));
+			nr += 1;
 			CHECK(PtlCTWait(ctx->ct_h, nr, &event));
 			if (i >= p->warmup) {
 				timings[i - p->warmup] = get_wtime() - t0;
@@ -392,6 +500,7 @@ void get_msg(ptl_ctx_t* ctx,
 	}
 	else if (BANDWIDTH == p->type) {
 		double t0 = 0;
+		ptl_size_t nr = 0;
 		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
@@ -419,7 +528,7 @@ void get_msg(ptl_ctx_t* ctx,
 	}
 	else if (MSGRATE == p->type) {
 		double t0 = 0;
-		nr += p->iterations + p->warmup;
+		ptl_size_t nr = p->iterations + p->warmup;
 		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
@@ -442,6 +551,106 @@ void get_msg(ptl_ctx_t* ctx,
 			exit(EXIT_FAILURE);
 		}
 	}
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
+	CHECK(PtlCTSet(ctx->ct_h, zero));
+}
+
+void put_msg_event(ptl_ctx_t* ctx,
+                   parameter_t* p,
+                   const ptl_size_t msg_size,
+                   double* timings) {
+	ptl_event_t event;
+	const ptl_size_t local_offset =
+	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
+	const ptl_size_t remote_offset =
+	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
+
+	if (LATENCY == p->type) {
+		double t0 = 0;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			CHECK(PtlPut(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             PTL_ACK_REQ,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL,
+			             0));
+			CHECK(PtlEQWait(ctx->md_eq_h, &event));
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "put_msg failed\n");
+				exit(EXIT_FAILURE);
+			}
+
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+		}
+	}
+	else if (BANDWIDTH == p->type) {
+		double t0 = 0;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			for (int w = 0; w < p->window_size; ++w) {
+				CHECK(PtlPut(ctx->md_h,
+				             local_offset,
+				             msg_size,
+				             PTL_ACK_REQ,
+				             ctx->peer,
+				             DATA_PT_IDX,
+				             remote_offset,
+				             0,
+				             NULL,
+				             0));
+			}
+			for (int u = 0; u < p->window_size; ++u) {
+				CHECK(PtlEQWait(ctx->md_eq_h, &event));
+				if (PTL_NI_OK != event.ni_fail_type) {
+					fprintf(stderr, "put_msg failed\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+		}
+	}
+	else if (MSGRATE == p->type) {
+		double t0 = 0;
+		ptl_size_t nr = p->iterations + p->warmup;
+		for (int i = 0; i < p->iterations + p->warmup; ++i) {
+			if (i >= p->warmup) {
+				t0 = get_wtime();
+			}
+			CHECK(PtlPut(ctx->md_h,
+			             local_offset,
+			             msg_size,
+			             PTL_ACK_REQ,
+			             ctx->peer,
+			             DATA_PT_IDX,
+			             remote_offset,
+			             0,
+			             NULL,
+			             0));
+			if (i >= p->warmup) {
+				timings[i - p->warmup] = get_wtime() - t0;
+			}
+		}
+		for (int u = 0; u < p->iterations + p->warmup; ++u) {
+			CHECK(PtlEQWait(ctx->md_eq_h, &event));
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "put_msg failed\n");
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
 }
 
 void put_msg(ptl_ctx_t* ctx,
@@ -453,10 +662,10 @@ void put_msg(ptl_ctx_t* ctx,
 	    p->memory_mode == FAULT ? (ptl_size_t) ctx->msg_buffer : 0;
 	const ptl_size_t remote_offset =
 	    p->memory_mode == FAULT ? ctx->peer_offset : 0;
-	ptl_size_t nr = 0;
 
 	if (LATENCY == p->type) {
 		double t0 = 0;
+		ptl_size_t nr = 0;
 		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
@@ -484,6 +693,7 @@ void put_msg(ptl_ctx_t* ctx,
 	}
 	else if (BANDWIDTH == p->type) {
 		double t0 = 0;
+		ptl_size_t nr = 0;
 		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
@@ -513,7 +723,7 @@ void put_msg(ptl_ctx_t* ctx,
 	}
 	else if (MSGRATE == p->type) {
 		double t0 = 0;
-		nr += p->iterations + p->warmup;
+		ptl_size_t nr = p->iterations + p->warmup;
 		for (int i = 0; i < p->iterations + p->warmup; ++i) {
 			if (i >= p->warmup) {
 				t0 = get_wtime();
@@ -538,6 +748,8 @@ void put_msg(ptl_ctx_t* ctx,
 			exit(EXIT_FAILURE);
 		}
 	}
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
+	CHECK(PtlCTSet(ctx->ct_h, zero));
 }
 
 void print_header(parameter_t* p) {
@@ -552,7 +764,7 @@ void print_header(parameter_t* p) {
 void print_result(parameter_t* p, const ptl_size_t msg_size, double* timings) {
 	if ((LATENCY == p->type) || (MSGRATE == p->type)) {
 		for (int i = 0; i < p->iterations; ++i) {
-			printf("%i\t%lu\t%.4f\n", i, msg_size, timings[i]);
+			printf("%i\t%lu\t%.4f\n", i, msg_size, timings[i] * 1e-3);
 		}
 	}
 	else {
@@ -683,16 +895,24 @@ int run_client(parameter_t* p) {
 			break;
 	}
 
-	options = PTL_MD_VOLATILE | PTL_MD_EVENT_SUCCESS_DISABLE |
-	          PTL_MD_EVENT_CT_ACK | PTL_MD_EVENT_CT_REPLY;
+	options = PTL_MD_VOLATILE;
+
+	if (CT_EVENT == p->event_type) {
+		options |= PTL_MD_EVENT_CT_ACK | PTL_MD_EVENT_CT_REPLY |
+		           PTL_MD_EVENT_SUCCESS_DISABLE;
+	}
+	else {
+		options |= PTL_MD_EVENT_SEND_DISABLE;
+	}
 
 	md.options = options;
 	md.ct_handle = ctx.ct_h;
-	md.eq_handle = PTL_EQ_NONE;
+	md.eq_handle = ctx.md_eq_h;
 
 	CHECK(PtlMDBind(ctx.ni_h, &md, &ctx.md_h));
 
 	double* timings = malloc(p->iterations * sizeof(double));
+	memset((void*) timings, 0, p->iterations * sizeof(double));
 
 	send_cmd(&ctx, "i", sizeof(char));
 	ptl_size_t rc = receive_cmd(&ctx);
@@ -703,29 +923,48 @@ int run_client(parameter_t* p) {
 
 	if (p->op == PUT) {
 		if (p->msg_size) {
-			put_msg(&ctx, p, p->msg_size, timings);
+			if (CT_EVENT == p->event_type) {
+				put_msg(&ctx, p, p->msg_size, timings);
+			}
+			else {
+				put_msg_event(&ctx, p, p->msg_size, timings);
+			}
 			print_result(p, p->msg_size, timings);
 		}
 		else if (p->min_msg_size && p->max_msg_size) {
 			for (ptl_size_t m = p->min_msg_size; m <= p->max_msg_size; m *= 2) {
-				if (m > ctx.buffer_len) {
-					fprintf(stderr, "Invalid msg size\n");
-					goto END;
+				if (CT_EVENT == p->event_type) {
+					put_msg(&ctx, p, m, timings);
 				}
-				put_msg(&ctx, p, m, timings);
+				else {
+					put_msg_event(&ctx, p, m, timings);
+				}
 				print_result(p, m, timings);
+				memset((void*) timings, 0, p->iterations * sizeof(double));
 			}
 		}
 	}
 	else if (p->op == GET) {
 		if (p->msg_size) {
-			get_msg(&ctx, p, p->msg_size, timings);
+			if (CT_EVENT == p->event_type) {
+				get_msg(&ctx, p, p->msg_size, timings);
+			}
+			else {
+				get_msg_event(&ctx, p, p->msg_size, timings);
+			}
 			print_result(p, p->msg_size, timings);
+			memset((void*) timings, 0, p->iterations * sizeof(double));
 		}
 		else if (p->min_msg_size && p->max_msg_size) {
 			for (ptl_size_t m = p->min_msg_size; m < p->max_msg_size; m *= 2) {
-				get_msg(&ctx, p, m, timings);
+				if (CT_EVENT == p->event_type) {
+					get_msg(&ctx, p, m, timings);
+				}
+				else {
+					get_msg_event(&ctx, p, m, timings);
+				}
 				print_result(p, m, timings);
+				memset((void*) timings, 0, p->iterations * sizeof(double));
 			}
 		}
 	}
@@ -777,7 +1016,7 @@ int run_server(parameter_t* p) {
 			options |= PTL_ME_IS_ACCESSIBLE;
 		}
 		else if (FAULT == p->memory_mode) {
-			ctx.msg_buffer = alloc_pinned_memory(ctx.buffer_len);
+			ctx.msg_buffer = alloc_memory(ctx.buffer_len);
 			me.start = NULL;
 			me.length = PTL_SIZE_MAX;
 		}
@@ -819,7 +1058,7 @@ int run_server(parameter_t* p) {
 			options |= PTL_LE_IS_ACCESSIBLE;
 		}
 		else if (FAULT == p->memory_mode) {
-			ctx.msg_buffer = alloc_pinned_memory(ctx.buffer_len);
+			ctx.msg_buffer = alloc_memory(ctx.buffer_len);
 			le.start = NULL;
 			le.length = PTL_SIZE_MAX;
 		}
