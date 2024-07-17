@@ -72,7 +72,7 @@ void print_ni_limits(const ptl_ni_limits_t ni_limits) {
 
 void generate_filename(const char* base_filename, char* filename, size_t size) {
 	pid_t pid = getpid();
-	snprintf(filename, size, "%s_%d.dat", base_filename, pid);
+	snprintf(filename, size, "%s.dat", base_filename);
 }
 
 int main(int argc, char* argv[]) {
@@ -185,19 +185,18 @@ int main(int argc, char* argv[]) {
 
 		ptl_handle_md_t md_h;
 
-		for (int w = 0; w < warmup; ++w) {
+		double t0 = 0, t1 = 0;
+		for (int i = 0; i < iterations + warmup; ++i) {
+			if (i >= warmup) {
+				t0 = get_wtime();
+			}
 			CHECK(PtlMDBind(ni_h, &md, &md_h));
+			if (i >= warmup) {
+				t1 = get_wtime() - t0;
+				fprintf(file, "%i\t%f\n", i - warmup, t1);
+			}
 			CHECK(PtlMDRelease(md_h));
 		}
-
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
-			CHECK(PtlMDRelease(md_h));
-		}
-
 		munlock(ptr, size);
 		free(ptr);
 		fclose(file);
@@ -232,116 +231,16 @@ int main(int argc, char* argv[]) {
 			CHECK(PtlMDRelease(md_h));
 		}
 
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
+		double t0 = 0, t1 = 0;
+		for (int i = 0; i < iterations + warmup; ++i) {
+			if (i >= warmup) {
+				t0 = get_wtime();
+			}
 			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
-			CHECK(PtlMDRelease(md_h));
-		}
-		fclose(file);
-	}
-
-	//MDBind IOVEC
-	{
-		char filename[256];
-		generate_filename("MD-iovec", filename, sizeof(filename));
-		FILE* file = fopen(filename, "w");
-
-		if (NULL == file) {
-			fprintf(stderr, "Failed to open file");
-			return EXIT_FAILURE;
-		}
-		fprintf(file, "Iteration\tTime\n");
-
-		int n_iovecs = 128;
-		int iovec_len = 2 * MiB;
-
-		void* io_ptrs[n_iovecs];
-		ptl_iovec_t iovecs[n_iovecs];
-
-		for (int i = 0; i < n_iovecs; ++i) {
-			io_ptrs[i] = malloc(iovec_len);
-			mlock(io_ptrs[i], iovec_len);
-			iovecs[i].iov_base = io_ptrs[i];
-			iovecs[i].iov_len = iovec_len;
-		}
-
-		unsigned long md_options = PTL_MD_EVENT_SUCCESS_DISABLE |
-		                           PTL_MD_EVENT_CT_REPLY | PTL_MD_EVENT_CT_ACK |
-		                           PTL_MD_VOLATILE | PTL_IOVEC;
-		ptl_md_t md = {
-		    .start = &iovecs,
-		    .length = n_iovecs,
-		    .options = md_options,
-		    .eq_handle = PTL_EQ_NONE,
-		};
-
-		ptl_handle_md_t md_h;
-
-		for (int w = 0; w < warmup; ++w) {
-			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			CHECK(PtlMDRelease(md_h));
-		}
-
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
-			CHECK(PtlMDRelease(md_h));
-		}
-		fclose(file);
-
-		for (int i = 0; i < n_iovecs; ++i) {
-			munlock(io_ptrs[i], iovec_len);
-			free(io_ptrs[i]);
-		}
-	}
-
-	//MDBind IOVEC  size-max
-	{
-		char filename[256];
-		generate_filename("MD-iovec-size-max", filename, sizeof(filename));
-		FILE* file = fopen(filename, "w");
-
-		if (NULL == file) {
-			fprintf(stderr, "Failed to open file");
-			return EXIT_FAILURE;
-		}
-		fprintf(file, "Iteration\tTime\n");
-
-		int n_iovecs = 128;
-
-		ptl_iovec_t iovecs[n_iovecs];
-
-		for (int i = 0; i < n_iovecs; ++i) {
-			iovecs[i].iov_base = NULL;
-			iovecs[i].iov_len = PTL_SIZE_MAX;
-		}
-
-		unsigned long md_options = PTL_MD_EVENT_SUCCESS_DISABLE |
-		                           PTL_MD_EVENT_CT_REPLY | PTL_MD_EVENT_CT_ACK |
-		                           PTL_MD_VOLATILE | PTL_IOVEC;
-		ptl_md_t md = {
-		    .start = &iovecs,
-		    .length = n_iovecs,
-		    .options = md_options,
-		    .eq_handle = PTL_EQ_NONE,
-		};
-
-		ptl_handle_md_t md_h;
-
-		for (int w = 0; w < warmup; ++w) {
-			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			CHECK(PtlMDRelease(md_h));
-		}
-
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(PtlMDBind(ni_h, &md, &md_h));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
+			if (i >= warmup) {
+				t1 = get_wtime() - t0;
+				fprintf(file, "%i\t%f\n", i - warmup, t1);
+			}
 			CHECK(PtlMDRelease(md_h));
 		}
 		fclose(file);
@@ -381,20 +280,18 @@ int main(int argc, char* argv[]) {
 		ptl_handle_le_t le_h;
 		ptl_event_t event;
 
-		for (int w = 0; w < warmup; ++w) {
+		double t0 = 0, t1 = 0;
+		for (int i = 0; i < iterations + warmup; ++i) {
+			if (i >= warmup) {
+				t0 = get_wtime();
+			}
 			CHECK(
 			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
 			CHECK(PtlEQWait(eq_h, &event));
-			CHECK(PtlLEUnlink(le_h));
-		}
-
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
+			if (i >= warmup) {
+				t1 = get_wtime() - t0;
+				fprintf(file, "%i\t%f\n", i - warmup, t1);
+			}
 			CHECK(PtlLEUnlink(le_h));
 		}
 		fclose(file);
@@ -434,20 +331,18 @@ int main(int argc, char* argv[]) {
 		ptl_handle_le_t le_h;
 		ptl_event_t event;
 
-		for (int w = 0; w < warmup; ++w) {
+		double t0 = 0, t1 = 0;
+		for (int i = 0; i < iterations + warmup; ++i) {
+			if (i >= warmup) {
+				t0 = get_wtime();
+			}
 			CHECK(
 			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
 			CHECK(PtlEQWait(eq_h, &event));
-			CHECK(PtlLEUnlink(le_h));
-		}
-
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
+			if (i >= warmup) {
+				t1 = get_wtime() - t0;
+				fprintf(file, "%i\t%f\n", i - warmup, t1);
+			}
 			CHECK(PtlLEUnlink(le_h));
 		}
 		fclose(file);
@@ -455,10 +350,10 @@ int main(int argc, char* argv[]) {
 		CHECK(PtlPTFree(ni_h, pt_idx));
 	}
 
-	//LEAppend IOVEC
+	// Triggered Ops setup time
 	{
 		char filename[256];
-		generate_filename("LE-iovec", filename, sizeof(filename));
+		generate_filename("triggered-put", filename, sizeof(filename));
 		FILE* file = fopen(filename, "w");
 
 		if (NULL == file) {
@@ -468,118 +363,78 @@ int main(int argc, char* argv[]) {
 		fprintf(file, "Iteration\tTime\n");
 
 		ptl_handle_eq_t eq_h;
+		ptl_handle_ct_t ct_h;
 		ptl_pt_index_t pt_idx;
 
 		CHECK(PtlEQAlloc(ni_h, 16, &eq_h));
+		CHECK(PtlCTAlloc(ni_h, &ct_h));
 		CHECK(PtlPTAlloc(ni_h, 0, eq_h, 0, &pt_idx));
 
-		int n_iovecs = 128;
-		int iovec_len = 2 * MiB;
-
-		void* io_ptrs[n_iovecs];
-		ptl_iovec_t iovecs[n_iovecs];
-
-		for (int i = 0; i < n_iovecs; ++i) {
-			io_ptrs[i] = malloc(iovec_len);
-			mlock(io_ptrs[i], iovec_len);
-			iovecs[i].iov_base = io_ptrs[i];
-			iovecs[i].iov_len = iovec_len;
-		}
-
 		ptl_le_t le = {
-		    .start = &iovecs,
-		    .length = n_iovecs,
+		    .start = NULL,
+		    .length = PTL_SIZE_MAX,
 		    .uid = PTL_UID_ANY,
 		    .options = PTL_LE_OP_PUT | PTL_LE_OP_GET |
-		               PTL_LE_EVENT_SUCCESS_DISABLE |
-		               PTL_LE_EVENT_COMM_DISABLE | PTL_IOVEC,
+		               PTL_LE_EVENT_SUCCESS_DISABLE | PTL_LE_EVENT_COMM_DISABLE,
 		    .ct_handle = PTL_CT_NONE,
 		};
 
 		ptl_handle_le_t le_h;
 		ptl_event_t event;
 
-		for (int w = 0; w < warmup; ++w) {
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			CHECK(PtlLEUnlink(le_h));
-		}
+		CHECK(PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
+		CHECK(PtlEQWait(eq_h, &event));
 
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
-			CHECK(PtlLEUnlink(le_h));
-		}
-		fclose(file);
-		CHECK(PtlEQFree(eq_h));
-		CHECK(PtlPTFree(ni_h, pt_idx));
-		for (int i = 0; i < n_iovecs; ++i) {
-			munlock(io_ptrs[i], iovec_len);
-			free(io_ptrs[i]);
-		}
-	}
+		unsigned long md_options = PTL_MD_EVENT_SUCCESS_DISABLE |
+		                           PTL_MD_EVENT_CT_REPLY | PTL_MD_EVENT_CT_ACK |
+		                           PTL_MD_VOLATILE;
 
-	//LEAppend IOVEC
-	{
-		char filename[256];
-		generate_filename("LE-iovec-size-max", filename, sizeof(filename));
-		FILE* file = fopen(filename, "w");
-
-		if (NULL == file) {
-			fprintf(stderr, "Failed to open file");
-			return EXIT_FAILURE;
-		}
-		fprintf(file, "Iteration\tTime\n");
-
-		ptl_handle_eq_t eq_h;
-		ptl_pt_index_t pt_idx;
-
-		CHECK(PtlEQAlloc(ni_h, 16, &eq_h));
-		CHECK(PtlPTAlloc(ni_h, 0, eq_h, 0, &pt_idx));
-
-		int n_iovecs = 128;
-		ptl_iovec_t iovecs[n_iovecs];
-
-		for (int i = 0; i < n_iovecs; ++i) {
-			iovecs[i].iov_base = NULL;
-			iovecs[i].iov_len = PTL_SIZE_MAX;
-		}
-
-		ptl_le_t le = {
-		    .start = &iovecs,
-		    .length = n_iovecs,
-		    .uid = PTL_UID_ANY,
-		    .options = PTL_LE_OP_PUT | PTL_LE_OP_GET |
-		               PTL_LE_EVENT_SUCCESS_DISABLE |
-		               PTL_LE_EVENT_COMM_DISABLE | PTL_IOVEC,
-		    .ct_handle = PTL_CT_NONE,
+		ptl_md_t md = {
+		    .start = NULL,
+		    .length = PTL_SIZE_MAX,
+		    .options = md_options,
+		    .eq_handle = PTL_EQ_NONE,
 		};
 
-		ptl_handle_le_t le_h;
-		ptl_event_t event;
+		ptl_handle_md_t md_h;
 
-		for (int w = 0; w < warmup; ++w) {
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			CHECK(PtlLEUnlink(le_h));
+		CHECK(PtlMDBind(ni_h, &md, &md_h));
+
+		ptl_process_t peer;
+		peer.phys.nid = PTL_NID_ANY;
+		peer.phys.pid = PTL_PID_ANY;
+		ptl_size_t thresh = 1;
+
+		double t0 = 0, t1 = 0;
+
+		for (int i = 0; i < iterations + warmup; ++i) {
+			if (i >= warmup) {
+				t0 = get_wtime();
+			}
+
+			CHECK(PtlTriggeredPut(md_h,
+			                      0,
+			                      1024,
+			                      PTL_CT_ACK_REQ,
+			                      peer,
+			                      pt_idx,
+			                      0,
+					      0,
+			                      NULL,
+			                      0,
+			                      ct_h,
+			                      thresh));
+
+			if (i >= warmup) {
+				t1 = get_wtime() - t0;
+				fprintf(file, "%i\t%f\n", i - warmup, t1);
+			}
+			CHECK(PtlCTCancelTriggered(ct_h));
 		}
 
-		for (int i = 0; i < iterations; ++i) {
-			double t0 = get_wtime();
-			CHECK(
-			    PtlLEAppend(ni_h, pt_idx, &le, PTL_PRIORITY_LIST, NULL, &le_h));
-			CHECK(PtlEQWait(eq_h, &event));
-			double t = get_wtime() - t0;
-			fprintf(file, "%i\t%f\n", i, t);
-			CHECK(PtlLEUnlink(le_h));
-		}
 		fclose(file);
+		CHECK(PtlLEUnlink(le_h));
+		CHECK(PtlMDRelease(md_h));
 		CHECK(PtlEQFree(eq_h));
 		CHECK(PtlPTFree(ni_h, pt_idx));
 	}
