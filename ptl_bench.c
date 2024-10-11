@@ -614,9 +614,8 @@ int main(int argc, char* argv[]) {
 
 	if (0 > eret)
 		goto END;
-	if (opts.ni_mode == MATCHING) {
-	}
-	else if (opts.ni_mode != MATCHING && opts.type == LATENCY) {
+
+	if (LATENCY == opts.type) {
 		if (opts.op == PUT) {
 			p4_put_latency();
 		}
@@ -624,7 +623,7 @@ int main(int argc, char* argv[]) {
 			p4_get_latency();
 		}
 	}
-	else if (opts.ni_mode != MATCHING && opts.type == BANDWIDTH) {
+	else if (BANDWIDTH == opts.type) {
 		if (opts.op == PUT) {
 			p4_put_bandwidth();
 		}
@@ -637,4 +636,5 @@ END:
 	destroy_p4_ctx(&ctx);
 	PtlFini();
 	MPI_Finalize();
+	return eret;
 }
