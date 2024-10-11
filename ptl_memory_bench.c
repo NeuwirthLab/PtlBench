@@ -12,6 +12,7 @@ static int num_ranks;
 static p4_ctx_t ctx;
 static memory_benchmark_opts_t opts;
 static size_t page_size;
+static char processor_name[MPI_MAX_PROCESSOR_NAME];
 
 int* cache_buffer;
 void** page_buffer;
@@ -57,7 +58,78 @@ void free_cold_pages(const int n_pages) {
 	}
 }
 
-// naming convention for benchmark functions: <local page status>_<remote page status>
+void run_benchmark2() {
+	ptl_handle_le_t le_h;
+	ptl_handle_md_t md_h;
+	ptl_index_t index;
+	ptl_event_t event;
+	int eret = -1;
+
+	p4_pt_alloc(&ctx, &index);
+
+	if (0 == rank) {
+		// print header
+		fprintf(stdout,
+		        "local_page_state,remote_page_state,msg_size,latency\n");
+	}
+
+	for (int i = 0; i < opts.iterations; ++i) {
+		get_cold_pages(1);
+
+		if (1 == rank) {
+			p4_le_insert(&ctx, &le_h, page_buffer[0], page_size, index);
+			if (HOT == opts.remote_state) {
+				touch_cold_pages(1);
+			}
+		}
+		else {
+			p4_md_alloc_eq(&ctx, &md_h, page_buffer[0], page_size);
+			if (HOT == opts.local_state) {
+				touch_cold_pages(1);
+			}
+		}
+
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		if (0 == rank) {
+			ptl_size_t block_offset = get_random_index() * opts.msg_size;
+			invalidate_cache();
+
+			double t0 = MPI_Wtime();
+			eret = PtlPut(md_h,
+			              block_offset,
+			              opts.msg_size,
+			              PTL_ACK_REQ,
+			              ctx.peer_addr,
+			              index,
+			              0,
+			              block_offset,
+			              NULL,
+			              0);
+
+			PtlEQWait(ctx.eq_h, &event);
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "PtlPut failed with %i\n", event.ni_fail_type);
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+			double t = MPI_Wtime() - t0;
+			fprintf(stdout,
+			        "%s,%s,%i,%.4f\n",
+			        opts.local_state == COLD ? "cold" : "hot",
+			        opts.remote_state == COLD ? "cold" : "hot",
+			        opts.msg_size,
+			        t * 1e6);
+			p4_md_free(md_h);
+		}
+		MPI_Barrier(MPI_COMM_WORLD);
+		if (1 == rank) {
+			p4_le_remove(le_h);
+		}
+		free_cold_pages(1);
+	}
+	p4_pt_free(&ctx, index);
+}
+
 void run_benchmark() {
 	ptl_handle_le_t le_h;
 	ptl_handle_md_t md_h;
@@ -103,7 +175,7 @@ void run_benchmark() {
 
 	if (0 == rank) {
 		// print header
-		fprintf(stderr,
+		fprintf(stdout,
 		        "local_page_state,remote_page_state,msg_size,latency\n");
 
 		for (int i = 0; i < opts.iterations; ++i) {
@@ -124,8 +196,12 @@ void run_benchmark() {
 			              NULL,
 			              0);
 			PtlEQWait(ctx.eq_h, &event);
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "PtlPut failed with %i\n", event.ni_fail_type);
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
 			double t = MPI_Wtime() - t0;
-			fprintf(stderr,
+			fprintf(stdout,
 			        "%s,%s,%i,%.4f\n",
 			        opts.local_state == COLD ? "cold" : "hot",
 			        opts.remote_state == COLD ? "cold" : "hot",
@@ -215,14 +291,19 @@ int main(int argc, char* argv[]) {
 				exit(EXIT_FAILURE);
 		}
 	}
+
+	int name_len;
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+	MPI_Get_processor_name(processor_name, &name_len);
 
 	if (2 != num_ranks) {
 		fprintf(stderr, "Benchmark requires exactly two processes\n");
 		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
 	}
+
+	fprintf(stderr, "Proc %i on %s\n", rank, processor_name);
 
 	PtlInit();
 	eret = init_p4_ctx(&ctx, PTL_NI_NO_MATCHING);
@@ -246,7 +327,7 @@ int main(int argc, char* argv[]) {
 
 	srand(time(0));
 
-	run_benchmark();
+	run_benchmark2();
 
 END:
 	free(cache_buffer);
