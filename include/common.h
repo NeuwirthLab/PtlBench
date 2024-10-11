@@ -10,11 +10,12 @@
 #include <string.h>
 #include <unistd.h>
 
-typedef enum { MATCHING = 0, NON_MATCHING } ni_mode_t;
-typedef enum { LATENCY = 0, BANDWIDTH } benchmark_type_t;
-typedef enum { PUT = 0, GET } operation_t;
-typedef enum { REGISTERED = 0, UNREGISTERED } memory_mode_t;
-typedef enum { COUNTING = 0, FULL } event_type_t;
+typedef enum { MATCHING = 1, NON_MATCHING } ni_mode_t;
+typedef enum { LATENCY = 1, BANDWIDTH } benchmark_type_t;
+typedef enum { PUT = 1, GET } operation_t;
+typedef enum { REGISTERED = 1, UNREGISTERED } memory_mode_t;
+typedef enum { COUNTING = 1, FULL } event_type_t;
+typedef enum { COLD = 1, HOT } page_state_t;
 
 typedef struct {
 	ni_mode_t ni_mode;
@@ -28,8 +29,16 @@ typedef struct {
 	int msg_size;
 	int min_msg_size;
 	int max_msg_size;
-	size_t cache_size;
 } benchmark_opts_t;
+
+typedef struct {
+	int iterations;
+	int warmup;
+	int msg_size;
+	size_t cache_size;
+	page_state_t local_state;
+	page_state_t remote_state;
+} memory_benchmark_opts_t;
 
 typedef struct {
 	ptl_handle_ni_t ni_h;
