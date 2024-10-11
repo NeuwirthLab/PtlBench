@@ -131,6 +131,15 @@ int p4_md_alloc_eq(p4_ctx_t* const ctx,
 	return PtlMDBind(ctx->ni_h, &md, md_h);
 }
 
+int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h) {
+	ptl_md_t md = {.start = NULL,
+	               .length = PTL_SIZE_MAX,
+	               .options = PTL_MD_EVENT_SEND_DISABLE,
+	               .ct_handle = PTL_CT_NONE,
+	               .eq_handle = ctx->eq_h};
+	return PtlMDBind(ctx->ni_h, &md, md_h);
+}
+
 void p4_md_free(ptl_handle_md_t md_h) {
 	PtlMDRelease(md_h);
 }
@@ -145,6 +154,37 @@ int p4_le_insert(p4_ctx_t* const ctx,
 
 	ptl_le_t le = {.start = start,
 	               .length = length,
+	               .options = PTL_LE_OP_GET | PTL_LE_OP_PUT |
+	                          PTL_LE_EVENT_COMM_DISABLE |
+	                          PTL_LE_EVENT_UNLINK_DISABLE,
+	               .uid = PTL_UID_ANY,
+	               .ct_handle = PTL_CT_NONE};
+
+	eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
+	if (PTL_OK != eret)
+		return eret;
+
+	PtlEQWait(ctx->eq_h, &event);
+
+	if (PTL_EVENT_LINK != event.type) {
+		fprintf(stderr, "Failed to link LE\n");
+		return -1;
+	}
+	if (PTL_NI_OK != event.ni_fail_type) {
+		fprintf(stderr, "ni_fail_type != PTL_NI_OK");
+		return -1;
+	}
+	return eret;
+}
+
+int p4_le_insert_empty(p4_ctx_t* const ctx,
+                       ptl_handle_le_t* const le_h,
+                       const ptl_index_t index) {
+	int eret = -1;
+	ptl_event_t event;
+
+	ptl_le_t le = {.start = NULL,
+	               .length = PTL_SIZE_MAX,
 	               .options = PTL_LE_OP_GET | PTL_LE_OP_PUT |
 	                          PTL_LE_EVENT_COMM_DISABLE |
 	                          PTL_LE_EVENT_UNLINK_DISABLE,

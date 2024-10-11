@@ -29,4 +29,8 @@ int p4_me_insert_persistent(p4_ctx_t* const ctx,
                             const ptl_index_t index);
 void p4_me_remove(ptl_handle_me_t me_h);
 int alloc_buffer_init(void** ptr, size_t bytes);
+int p4_le_insert_empty(p4_ctx_t* const ctx,
+                       ptl_handle_le_t* const le_h,
+                       const ptl_index_t index);
+int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h);
 #endif

@@ -28,6 +28,7 @@ typedef struct {
 	int msg_size;
 	int min_msg_size;
 	int max_msg_size;
+	size_t cache_size;
 } benchmark_opts_t;
 
 typedef struct {

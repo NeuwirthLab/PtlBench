@@ -5,7 +5,11 @@ find_package(Portals REQUIRED)
 find_package(MPI REQUIRED)
 
 add_executable(ptl_bench "ptl_bench.c" "util.c")
-
 target_compile_features(ptl_bench PRIVATE "c_std_11")
-#target_include_directories(ptl_bench ".")
+target_include_directories(ptl_bench PUBLIC "./include")
 target_link_libraries(ptl_bench PUBLIC "Portals::Portals" "MPI::MPI_C")
+
+add_executable(ptl_memory_bench "ptl_memory_bench.c" "util.c")
+target_compile_features(ptl_memory_bench PRIVATE "c_std_11")
+target_include_directories(ptl_memory_bench PUBLIC "./include")
+target_link_libraries(ptl_memory_bench PUBLIC "Portals::Portals" "MPI::MPI_C")
