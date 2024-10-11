@@ -10,15 +10,15 @@
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
-static benchmark_opts_t opts;
+static memory_benchmark_opts_t opts;
 static size_t page_size;
 
 int* cache_buffer;
 void** page_buffer;
 
 int get_random_index() {
-	int ints_per_page = page_size / sizeof(int);
-	return rand() % ints_per_page;
+	int blocks = page_size / opts.msg_size;
+	return rand() % blocks;
 }
 
 void invalidate_cache() {
@@ -40,7 +40,6 @@ void touch_cold_pages(const int n_pages) {
 }
 
 int get_cold_pages(const int n_pages) {
-
 	for (int p = 0; p < n_pages; ++p) {
 		page_buffer[p] = mmap(NULL,
 		                      page_size,
@@ -58,65 +57,8 @@ void free_cold_pages(const int n_pages) {
 	}
 }
 
-void local_cold() {
-	ptl_handle_le_t le_h;
-	ptl_handle_md_t md_h;
-	ptl_index_t index;
-	ptl_event_t event;
-	int eret = -1;
-	void* buffer = NULL;
-
-	p4_pt_alloc(&ctx, &index);
-
-	if (0 == rank) {
-		p4_md_alloc_eq_empty(&ctx, &md_h);
-		get_cold_pages(opts.iterations);
-	}
-	else {
-		alloc_buffer_init(&buffer, opts.iterations * page_size);
-		p4_le_insert(&ctx, &le_h, buffer, opts.iterations * page_size, index);
-	}
-
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	if (0 == rank) {
-		for (int i = 0; i < opts.iterations; ++i) {
-			int* page = page_buffer[i];
-			int idx = get_random_index();
-			ptl_size_t rem_offset = i * page_size + idx * sizeof(int);
-
-			invalidate_cache();
-
-			double t0 = MPI_Wtime();
-			eret = PtlPut(md_h,
-			              (ptl_size_t) &page[idx],
-			              512,
-			              PTL_ACK_REQ,
-			              ctx.peer_addr,
-			              index,
-			              0,
-			              rem_offset,
-			              NULL,
-			              0);
-			PtlEQWait(ctx.eq_h, &event);
-			double t = MPI_Wtime() - t0;
-			fprintf(stderr, "local_cold,%.4f\n", t * 1e6);
-		}
-		p4_md_free(md_h);
-		free_cold_pages(opts.iterations);
-	}
-	MPI_Barrier(MPI_COMM_WORLD);
-	if (1 == rank) {
-		p4_le_remove(le_h);
-		free(buffer);
-	}
-	p4_pt_free(&ctx, index);
-}
-
-void remote_cold() {
-}
-
-void cold_cold() {
+// naming convention for benchmark functions: <local page status>_<remote page status>
+void run_benchmark() {
 	ptl_handle_le_t le_h;
 	ptl_handle_md_t md_h;
 	ptl_index_t index;
@@ -130,6 +72,9 @@ void cold_cold() {
 
 	if (0 == rank) {
 		p4_md_alloc_eq_empty(&ctx, &md_h);
+		if (HOT == opts.local_state) {
+			touch_cold_pages(opts.iterations);
+		}
 		MPI_Recv(addresses,
 		         opts.iterations,
 		         MPI_UNSIGNED_LONG,
@@ -137,10 +82,12 @@ void cold_cold() {
 		         1,
 		         MPI_COMM_WORLD,
 		         MPI_STATUS_IGNORE);
-		//touch_cold_pages(opts.iterations);
 	}
 	else {
 		p4_le_insert_empty(&ctx, &le_h, index);
+		if (HOT == opts.remote_state) {
+			touch_cold_pages(opts.iterations);
+		}
 		for (int i = 0; i < opts.iterations; ++i) {
 			addresses[i] = (unsigned long) page_buffer[i];
 		}
@@ -155,27 +102,35 @@ void cold_cold() {
 	MPI_Barrier(MPI_COMM_WORLD);
 
 	if (0 == rank) {
+		// print header
+		fprintf(stderr,
+		        "local_page_state,remote_page_state,msg_size,latency\n");
+
 		for (int i = 0; i < opts.iterations; ++i) {
-			int* page = page_buffer[i];
-			int idx = get_random_index();
-			ptl_size_t rem_offset = addresses[i] + idx * sizeof(int);
+			void* page = page_buffer[i];
+			ptl_size_t block_offset = get_random_index() * opts.msg_size;
 
 			invalidate_cache();
 
 			double t0 = MPI_Wtime();
 			eret = PtlPut(md_h,
-			              (ptl_size_t) &page[idx],
-			              512,
+			              (ptl_size_t) page + block_offset,
+			              opts.msg_size,
 			              PTL_ACK_REQ,
 			              ctx.peer_addr,
 			              index,
 			              0,
-			              rem_offset,
+			              addresses[i] + block_offset,
 			              NULL,
 			              0);
 			PtlEQWait(ctx.eq_h, &event);
 			double t = MPI_Wtime() - t0;
-			fprintf(stderr, "cold_cold,%.4f\n", t * 1e6);
+			fprintf(stderr,
+			        "%s,%s,%i,%.4f\n",
+			        opts.local_state == COLD ? "cold" : "hot",
+			        opts.remote_state == COLD ? "cold" : "hot",
+			        opts.msg_size,
+			        t * 1e6);
 		}
 		p4_md_free(md_h);
 	}
@@ -188,78 +143,44 @@ void cold_cold() {
 	p4_pt_free(&ctx, index);
 }
 
-void warm_warm() {
-	ptl_handle_le_t le_h;
-	ptl_handle_md_t md_h;
-	ptl_index_t index;
-	ptl_event_t event;
-	int eret = -1;
-	void* buffer = NULL;
-
-	p4_pt_alloc(&ctx, &index);
-
-	if (0 == rank) {
-		alloc_buffer_init(&buffer, opts.iterations * page_size);
-		p4_md_alloc_eq(&ctx, &md_h, buffer, opts.iterations * page_size);
-	}
-	else {
-		alloc_buffer_init(&buffer, opts.iterations * page_size);
-		p4_le_insert(&ctx, &le_h, buffer, opts.iterations * page_size, index);
-	}
-
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	if (0 == rank) {
-		for (int i = 0; i < opts.iterations; ++i) {
-
-			int idx = get_random_index();
-			ptl_size_t offset = i * page_size + idx * sizeof(int);
-
-			invalidate_cache();
-			double t0 = MPI_Wtime();
-			eret = PtlPut(md_h,
-			              offset,
-			              512,
-			              PTL_ACK_REQ,
-			              ctx.peer_addr,
-			              index,
-			              0,
-			              offset,
-			              NULL,
-			              0);
-			PtlEQWait(ctx.eq_h, &event);
-			double t = MPI_Wtime() - t0;
-			fprintf(stderr, "warm_warm,%.4f\n", t * 1e6);
-		}
-		p4_md_free(md_h);
-	}
-	MPI_Barrier(MPI_COMM_WORLD);
-	if (1 == rank) {
-		p4_le_remove(le_h);
-	}
-	free(buffer);
-	p4_pt_free(&ctx, index);
+void print_help_message() {
+	printf("Usage: ptl_memory_bench [options]\n");
+	printf("Options:\n");
+	printf(
+	    "  -i, --iterations <num>    Specify the number of iterations "
+	    "(required argument)\n");
+	printf(
+	    "  -c, --cache-size <size>   Set the cache size in bytes (required "
+	    "argument)\n");
+	printf("  -l, --local-hot           Enable local-hot mode (no argument)\n");
+	printf(
+	    "  -r, --remote-hot          Enable remote-hot mode (no argument)\n");
+	printf(
+	    "  -m, --msg_size <size>     Set the message size in bytes (required "
+	    "argument)\n");
+	printf(
+	    "  -h, --help                Display this help message (no "
+	    "argument)\n");
 }
-void print_help_message() {};
 
 int main(int argc, char* argv[]) {
 	int eret = -1;
 
 	static const struct option long_opts[] = {
-	    {"matching", no_argument, NULL, 'm'},
-	    {"registered", no_argument, NULL, 'r'},
-	    {"get", no_argument, NULL, 'g'},
 	    {"iterations", required_argument, NULL, 'i'},
 	    {"cache-size", required_argument, NULL, 'c'},
-	    {"msg_size", required_argument, NULL, 1},
+	    {"local-hot", no_argument, NULL, 'l'},
+	    {"remote-hot", no_argument, NULL, 'r'},
+	    {"msg_size", required_argument, NULL, 'm'},
 	    {"help", no_argument, NULL, 'h'}};
 
-	const char* const short_opts = "mrghi:c:";
+	const char* const short_opts = "i:c:m:lrh";
 
-	opts.op = PUT;
 	opts.iterations = 10;
-	opts.msg_size = 1024;
+	opts.msg_size = 512;
 	opts.cache_size = _8MiB;
+	opts.remote_state = COLD;
+	opts.local_state = COLD;
 
 	while (1) {
 		const int opt = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -267,15 +188,6 @@ int main(int argc, char* argv[]) {
 			break;
 		}
 		switch (opt) {
-			case 'm':
-				opts.ni_mode = MATCHING;
-				break;
-			case 'r':
-				opts.memory_mode = REGISTERED;
-				break;
-			case 'g':
-				opts.op = GET;
-				break;
 			case 'i':
 				opts.iterations = atoi(optarg);
 				break;
@@ -283,8 +195,14 @@ int main(int argc, char* argv[]) {
 				opts.cache_size = atoi(optarg);
 				opts.cache_size *= MiB;
 				break;
-			case 1:
+			case 'm':
 				opts.msg_size = atoi(optarg);
+				break;
+			case 'l':
+				opts.local_state = HOT;
+				break;
+			case 'r':
+				opts.remote_state = HOT;
 				break;
 			case 'h':
 				print_help_message();
@@ -307,7 +225,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	PtlInit();
-	eret = init_p4_ctx(&ctx, opts.ni_mode);
+	eret = init_p4_ctx(&ctx, PTL_NI_NO_MATCHING);
 	if (PTL_OK != eret)
 		goto END;
 
@@ -328,12 +246,11 @@ int main(int argc, char* argv[]) {
 
 	srand(time(0));
 
-	//warm_warm();
-	//local_cold();
-	cold_cold();
+	run_benchmark();
 
 END:
 	free(cache_buffer);
+	free(page_buffer);
 	destroy_p4_ctx(&ctx);
 	PtlFini();
 	MPI_Finalize();
