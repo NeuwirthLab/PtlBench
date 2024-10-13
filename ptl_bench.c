@@ -15,6 +15,7 @@ int p4_put_latency() {
 	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
 	ptl_event_t event;
 	void* buffer = NULL;
 	double t0, t;
@@ -26,7 +27,7 @@ int p4_put_latency() {
 
 	//print header
 	if (0 == rank)
-		fprintf(stderr, "func,msg_size,latency\n");
+		fprintf(stdout, "func,msg_size,latency\n");
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
@@ -58,6 +59,7 @@ int p4_put_latency() {
 				eret = p4_md_alloc_eq(&ctx, &md_h, buffer, bytes);
 			if (PTL_OK != eret) {
 				free(buffer);
+				fprintf(stderr,"md alloc failed with %i\n",eret);
 				return eret;
 			}
 
@@ -107,8 +109,15 @@ int p4_put_latency() {
 				}
 				if (i >= opts.warmup) {
 					t = MPI_Wtime() - t0;
-					fprintf(stderr, "put,%lu,%.4f\n", msg_size, t * 1e6);
-					fflush(stderr);
+					fprintf(stdout, "put,%lu,%.4f\n", msg_size, t * 1e6);
+					fflush(stdout);
+				}
+			}
+			if(0 == rank && COUNTING == opts.event_type){
+				eret = PtlCTSet(ctx.ct_h,zero);
+				if(PTL_OK != eret){
+					fprintf(stderr,"PtlCTSet failed %i\n",eret);
+					return eret;
 				}
 			}
 			p4_md_free(md_h);
@@ -133,6 +142,7 @@ int p4_get_latency() {
 	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
 	ptl_event_t event;
 	void* buffer = NULL;
 	double t0, t;
@@ -143,7 +153,7 @@ int p4_get_latency() {
 	ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
 	//print header
 	if (0 == rank)
-		fprintf(stderr, "func,msg_size,latency\n");
+		fprintf(stdout, "func,msg_size,latency\n");
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
@@ -210,8 +220,15 @@ int p4_get_latency() {
 				}
 				if (i >= opts.warmup) {
 					t = MPI_Wtime() - t0;
-					fprintf(stderr, "get,%lu,%.4f\n", msg_size, t * 1e6);
-					fflush(stderr);
+					fprintf(stdout, "get,%lu,%.4f\n", msg_size, t * 1e6);
+					fflush(stdout);
+				}
+			}
+			if(0 == rank && COUNTING == opts.event_type){
+				eret = PtlCTSet(ctx.ct_h,zero);
+				if(PTL_OK != eret){
+					fprintf(stderr,"PtlCTSet failed with %i\n");
+					return eret;
 				}
 			}
 			p4_md_free(md_h);
@@ -227,6 +244,7 @@ int p4_get_latency() {
 	}
 	return 0;
 }
+
 int p4_put_bandwidth() {
 	int eret = -1;
 	ptl_handle_md_t md_h;
@@ -235,6 +253,7 @@ int p4_put_bandwidth() {
 	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
 	ptl_event_t event;
 	void* buffer = NULL;
 	double t0, t;
@@ -245,7 +264,7 @@ int p4_put_bandwidth() {
 	ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
 	//print header
 	if (0 == rank)
-		fprintf(stderr, "func,msg_size,bandwidth\n");
+		fprintf(stdout, "func,msg_size,bandwidth\n");
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
@@ -294,7 +313,6 @@ int p4_put_bandwidth() {
 					              0);
 					if (PTL_OK != eret) {
 						fprintf(stderr, "PtlPut failed with %i\n", eret);
-						fflush(stderr);
 						p4_md_free(md_h);
 						free(buffer);
 						return eret;
@@ -305,7 +323,6 @@ int p4_put_bandwidth() {
 					    ctx.ct_h, (i + 1) * opts.window_size, &ct_event);
 					if (PTL_OK != eret || ct_event.failure > 0) {
 						fprintf(stderr, "PtlCTWait failed\n");
-						fflush(stderr);
 						p4_md_free(md_h);
 						free(buffer);
 						return eret;
@@ -321,11 +338,18 @@ int p4_put_bandwidth() {
 				}
 				if (i >= opts.warmup) {
 					t = MPI_Wtime() - t0;
-					fprintf(stderr,
+					fprintf(stdout,
 					        "put,%lu,%.4f\n",
 					        msg_size,
 					        (msg_size * opts.window_size * 1e-6) / t);
-					fflush(stderr);
+					fflush(stdout);
+				}
+			}
+			if(0 == rank && COUNTING == opts.event_type){
+				eret = PtlCTSet(ctx.ct_h,zero);
+				if(PTL_OK != eret){
+					fprintf(stderr,"PtlCTSet failed with %i\n");
+					return eret;
 				}
 			}
 			p4_md_free(md_h);
@@ -341,6 +365,7 @@ int p4_put_bandwidth() {
 	}
 	return 0;
 }
+
 int p4_get_bandwidth() {
 	int eret = -1;
 	ptl_handle_md_t md_h;
@@ -349,6 +374,7 @@ int p4_get_bandwidth() {
 	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
+	ptl_ct_event_t zero = {.success = 0, .failure = 0};
 	ptl_event_t event;
 	void* buffer = NULL;
 	double t0, t;
@@ -359,7 +385,7 @@ int p4_get_bandwidth() {
 	ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
 	//print header
 	if (0 == rank)
-		fprintf(stderr, "func,msg_size,bandwidth\n");
+		fprintf(stdout, "func,msg_size,bandwidth\n");
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
@@ -429,11 +455,18 @@ int p4_get_bandwidth() {
 				}
 				if (i >= opts.warmup) {
 					t = MPI_Wtime() - t0;
-					fprintf(stderr,
+					fprintf(stdout,
 					        "get,%lu,%.4f\n",
 					        msg_size,
 					        (msg_size * opts.window_size * 1e-6) / t);
-					fflush(stderr);
+					fflush(stdout);
+				}
+			}
+			if(0 == rank && COUNTING == opts.event_type){
+				eret = PtlCTSet(ctx.ct_h,zero);
+				if(PTL_OK != eret){
+					fprintf(stderr,"PtlCTSet failed with %i\n");
+					return eret;
 				}
 			}
 			p4_md_free(md_h);
@@ -486,26 +519,23 @@ void print_help_message() {
 }
 
 void print_benchmark_opts() {
-	fprintf(stdout, "Benchmark Configuration:\n\n");
-	fprintf(stdout,
+	fprintf(stderr, "Benchmark Configuration:\n\n");
+	fprintf(stderr,
 	        "ni_mode: %s\n",
 	        opts.ni_mode == MATCHING ? "MATCHING" : "NON MATCHING");
-	fprintf(stdout, "op: %s\n", opts.op == PUT ? "PUT" : "GET");
+	fprintf(stderr, "op: %s\n", opts.op == PUT ? "PUT" : "GET");
 	fprintf(
 	    stdout, "type: %s\n", opts.type == LATENCY ? "LATENCY" : "BANDWIDTH");
-	fprintf(stdout,
-	        "memory_mode: %s\n",
-	        opts.memory_mode == REGISTERED ? "REGISTERED" : "UNREGISTERED");
-	fprintf(stdout,
+	fprintf(stderr,
 	        "event_type: %s\n",
 	        opts.event_type == COUNTING ? "COUNTING" : "FULL");
-	fprintf(stdout, "iterations: %i\n", opts.iterations);
-	fprintf(stdout, "warmup: %i\n", opts.warmup);
-	fprintf(stdout, "window_size: %i\n", opts.window_size);
-	fprintf(stdout, "msg_size: %i\n", opts.msg_size);
-	fprintf(stdout, "min_msg_size: %i\n", opts.min_msg_size);
-	fprintf(stdout, "max_msg_size: %i\n\n", opts.max_msg_size);
-	fflush(stdout);
+	fprintf(stderr, "iterations: %i\n", opts.iterations);
+	fprintf(stderr, "warmup: %i\n", opts.warmup);
+	fprintf(stderr, "window_size: %i\n", opts.window_size);
+	fprintf(stderr, "msg_size: %i\n", opts.msg_size);
+	fprintf(stderr, "min_msg_size: %i\n", opts.min_msg_size);
+	fprintf(stderr, "max_msg_size: %i\n\n", opts.max_msg_size);
+	fflush(stderr);
 }
 
 int main(int argc, char* argv[]) {
@@ -530,7 +560,6 @@ int main(int argc, char* argv[]) {
 	opts.ni_mode = NON_MATCHING;
 	opts.op = PUT;
 	opts.type = LATENCY;
-	opts.memory_mode = REGISTERED;
 	opts.iterations = 10;
 	opts.warmup = 10;
 	opts.window_size = 64;
@@ -570,13 +599,13 @@ int main(int argc, char* argv[]) {
 				opts.max_msg_size = opts.msg_size;
 				break;
 			case 2:
-				opts.min_msg_size = atoi(optarg);
+				opts.min_msg_size = atol(optarg);
 				break;
 			case 3:
-				opts.max_msg_size = atoi(optarg);
+				opts.max_msg_size = atol(optarg);
 				break;
 			case 'w':
-				opts.window_size = atoi(optarg);
+				opts.window_size = atol(optarg);
 				break;
 			case 'f':
 				opts.event_type = FULL;
@@ -598,7 +627,7 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
 
 	if (2 != num_ranks) {
-		fprintf(stderr, "Benchmark requires exactly two processes\n");
+		fprintf(stdout, "Benchmark requires exactly two processes\n");
 		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
 	}
 
