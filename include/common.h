@@ -26,9 +26,9 @@ typedef struct {
 	int iterations;
 	int warmup;
 	int window_size;
-	int msg_size;
-	int min_msg_size;
-	int max_msg_size;
+	size_t msg_size;
+	size_t min_msg_size;
+	size_t max_msg_size;
 } benchmark_opts_t;
 
 typedef struct {
