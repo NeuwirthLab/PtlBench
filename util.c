@@ -267,3 +267,10 @@ int alloc_buffer_init(void** ptr, size_t bytes) {
 	memset(*ptr, 'c', bytes);
 	return 0;
 }
+
+void invalidate_cache(int* const cache_buffer, const size_t elements) {
+	cache_buffer[0] = 1;
+	for (size_t i = 1; i < elements; ++i) {
+		cache_buffer[i] = cache_buffer[i - 1];
+	}
+}

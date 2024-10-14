@@ -2,6 +2,10 @@
 #define __UTIL_H__
 #include <portals4.h>
 #include "common.h"
+
+#define MiB 1024UL * 1024UL
+#define _8MiB 8 * MiB
+
 int init_p4_ctx(p4_ctx_t* const ctx, const ni_mode_t mode);
 void destroy_p4_ctx(p4_ctx_t* const ctx);
 int exchange_ni_address(p4_ctx_t* const ctx, const int my_rank);
@@ -33,4 +37,5 @@ int p4_le_insert_empty(p4_ctx_t* const ctx,
                        ptl_handle_le_t* const le_h,
                        const ptl_index_t index);
 int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h);
+void invalidate_cache(int* const cache_buffer, const size_t elements);
 #endif
