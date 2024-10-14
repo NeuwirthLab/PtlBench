@@ -261,7 +261,8 @@ void p4_me_remove(ptl_handle_me_t me_h) {
 }
 
 int alloc_buffer_init(void** ptr, size_t bytes) {
-	*ptr = malloc(bytes);
+	size_t page_size = sysconf(_SC_PAGESIZE);
+	posix_memalign(ptr, page_size, bytes);
 	if (NULL == *ptr)
 		return -1;
 	memset(*ptr, 'c', bytes);
