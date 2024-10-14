@@ -4,9 +4,6 @@
 #include "common.h"
 #include "util.h"
 
-#define MiB 1024UL * 1024UL
-#define _8MiB 8 * MiB
-
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
@@ -15,20 +12,12 @@ static size_t page_size;
 static char processor_name[MPI_MAX_PROCESSOR_NAME];
 
 int* cache_buffer;
+size_t cache_buffer_size;
 void** page_buffer;
 
 int get_random_index() {
 	int blocks = page_size / opts.msg_size;
 	return rand() % blocks;
-}
-
-void invalidate_cache() {
-	size_t elements = opts.cache_size / sizeof(int);
-	cache_buffer[0] = 1;
-
-	for (size_t i = 1; i < elements; ++i) {
-		cache_buffer[i] = cache_buffer[i - 1];
-	}
 }
 
 void touch_cold_pages(const int n_pages) {
@@ -58,7 +47,7 @@ void free_cold_pages(const int n_pages) {
 	}
 }
 
-void run_benchmark2() {
+void run_benchmark() {
 	ptl_handle_le_t le_h;
 	ptl_handle_md_t md_h;
 	ptl_index_t index;
@@ -93,7 +82,7 @@ void run_benchmark2() {
 
 		if (0 == rank) {
 			ptl_size_t block_offset = get_random_index() * opts.msg_size;
-			invalidate_cache();
+			invalidate_cache(cache_buffer, cache_buffer_size);
 
 			double t0 = MPI_Wtime();
 			eret = PtlPut(md_h,
@@ -127,95 +116,6 @@ void run_benchmark2() {
 		}
 		free_cold_pages(1);
 	}
-	p4_pt_free(&ctx, index);
-}
-
-void run_benchmark() {
-	ptl_handle_le_t le_h;
-	ptl_handle_md_t md_h;
-	ptl_index_t index;
-	ptl_event_t event;
-	int eret = -1;
-	unsigned long* addresses = NULL;
-
-	p4_pt_alloc(&ctx, &index);
-	get_cold_pages(opts.iterations);
-	addresses = malloc(opts.iterations * sizeof(unsigned long));
-
-	if (0 == rank) {
-		p4_md_alloc_eq_empty(&ctx, &md_h);
-		if (HOT == opts.local_state) {
-			touch_cold_pages(opts.iterations);
-		}
-		MPI_Recv(addresses,
-		         opts.iterations,
-		         MPI_UNSIGNED_LONG,
-		         1,
-		         1,
-		         MPI_COMM_WORLD,
-		         MPI_STATUS_IGNORE);
-	}
-	else {
-		p4_le_insert_empty(&ctx, &le_h, index);
-		if (HOT == opts.remote_state) {
-			touch_cold_pages(opts.iterations);
-		}
-		for (int i = 0; i < opts.iterations; ++i) {
-			addresses[i] = (unsigned long) page_buffer[i];
-		}
-		MPI_Send(addresses,
-		         opts.iterations,
-		         MPI_UNSIGNED_LONG,
-		         0,
-		         1,
-		         MPI_COMM_WORLD);
-	}
-
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	if (0 == rank) {
-		// print header
-		fprintf(stdout,
-		        "local_page_state,remote_page_state,msg_size,latency\n");
-
-		for (int i = 0; i < opts.iterations; ++i) {
-			void* page = page_buffer[i];
-			ptl_size_t block_offset = get_random_index() * opts.msg_size;
-
-			invalidate_cache();
-
-			double t0 = MPI_Wtime();
-			eret = PtlPut(md_h,
-			              (ptl_size_t) page + block_offset,
-			              opts.msg_size,
-			              PTL_ACK_REQ,
-			              ctx.peer_addr,
-			              index,
-			              0,
-			              addresses[i] + block_offset,
-			              NULL,
-			              0);
-			PtlEQWait(ctx.eq_h, &event);
-			if (PTL_NI_OK != event.ni_fail_type) {
-				fprintf(stderr, "PtlPut failed with %i\n", event.ni_fail_type);
-				MPI_Abort(MPI_COMM_WORLD, -1);
-			}
-			double t = MPI_Wtime() - t0;
-			fprintf(stdout,
-			        "%s,%s,%i,%.4f\n",
-			        opts.local_state == COLD ? "cold" : "hot",
-			        opts.remote_state == COLD ? "cold" : "hot",
-			        opts.msg_size,
-			        t * 1e6);
-		}
-		p4_md_free(md_h);
-	}
-	MPI_Barrier(MPI_COMM_WORLD);
-	free_cold_pages(opts.iterations);
-	if (1 == rank) {
-		p4_le_remove(le_h);
-	}
-	free(addresses);
 	p4_pt_free(&ctx, index);
 }
 
@@ -318,6 +218,7 @@ int main(int argc, char* argv[]) {
 	cache_buffer = malloc(opts.cache_size);
 	if (NULL == cache_buffer)
 		goto END;
+	cache_buffer_size = opts.cache_size / sizeof(int);
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -327,7 +228,7 @@ int main(int argc, char* argv[]) {
 
 	srand(time(0));
 
-	run_benchmark2();
+	run_benchmark();
 
 END:
 	free(cache_buffer);
