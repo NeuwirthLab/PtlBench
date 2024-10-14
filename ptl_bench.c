@@ -7,6 +7,9 @@ static int num_ranks;
 static benchmark_opts_t opts;
 static p4_ctx_t ctx;
 
+int* cache_buffer;
+size_t cache_buffer_size;
+
 int p4_put_latency() {
 	int eret = -1;
 	ptl_handle_md_t md_h;
@@ -62,6 +65,9 @@ int p4_put_latency() {
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
+				if (opts.cache_state == COLD_CACHE) {
+					invalidate_cache(cache_buffer, cache_buffer_size);
+				}
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
@@ -179,10 +185,12 @@ int p4_get_latency() {
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
+				if (opts.cache_state == COLD_CACHE) {
+					invalidate_cache(cache_buffer, cache_buffer_size);
+				}
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
-
 				eret = PtlGet(md_h,
 				              0,
 				              msg_size,
@@ -289,6 +297,9 @@ int p4_put_bandwidth() {
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
+				if (opts.cache_state == COLD_CACHE) {
+					invalidate_cache(cache_buffer, cache_buffer_size);
+				}
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
@@ -409,6 +420,9 @@ int p4_get_bandwidth() {
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
+				if (opts.cache_state == COLD_CACHE) {
+					invalidate_cache(cache_buffer, cache_buffer_size);
+				}
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
@@ -476,38 +490,48 @@ int p4_get_bandwidth() {
 }
 
 void print_help_message() {
-	fprintf(stdout, "Usage: ptl_bench [OPTIONS]\n\n");
+	fprintf(stdout, "Usage: [options]\n");
 	fprintf(stdout, "Options:\n");
-	fprintf(stdout, "  -m, --matching              Enable matching mode.\n");
-	fprintf(
-	    stdout,
-	    "  -b, --bandwidth             Enable bandwidth measurement mode.\n");
 	fprintf(stdout,
-	        "  -g, --get                   Enable get operation mode.\n");
+	        "  -m, --matching                 Enable matching mode (no "
+	        "argument required)\n");
 	fprintf(stdout,
-	        "  -u, --unregistered          Use unregistered memory for "
-	        "communication.\n");
+	        "  -b, --bandwidth                Enable bandwidth mode (no "
+	        "argument required)\n");
 	fprintf(stdout,
-	        "  -i, --iterations <NUM>      Set the number of iterations "
-	        "(required argument).\n");
+	        "  -g, --get                      Enable get operation (no "
+	        "argument required)\n");
 	fprintf(stdout,
-	        "  -x, --warmup <NUM>          Set the number of warm-up "
-	        "iterations (required argument).\n");
+	        "  -i, --iterations <value>       Specify the number of iterations "
+	        "(required argument)\n");
 	fprintf(stdout,
-	        "      --msg_size <SIZE>       Set the message size (required "
-	        "argument).\n");
+	        "  -x, --warmup <value>           Specify the number of warmup "
+	        "iterations (required argument)\n");
 	fprintf(stdout,
-	        "      --min_msg_size <SIZE>   Set the minimum message size "
-	        "(required argument).\n");
+	        "  --msg_size <value>             Specify the message size "
+	        "(required argument)\n");
 	fprintf(stdout,
-	        "      --max_msg_size <SIZE>   Set the maximum message size "
-	        "(required argument).\n");
+	        "  --min_msg_size <value>         Specify the minimum message size "
+	        "(required argument)\n");
 	fprintf(stdout,
-	        "  -w, --window-size <NUM>     Set the window size (required "
-	        "argument).\n");
-	fprintf(stdout, "  -f, --full                  Enable full event mode.\n");
+	        "  --max_msg_size <value>         Specify the maximum message size "
+	        "(required argument)\n");
 	fprintf(stdout,
-	        "  -h, --help                  Show this help message and exit.\n");
+	        "  -w, --window-size <value>      Specify the window size "
+	        "(required argument)\n");
+	fprintf(stdout,
+	        "  -c, --cache_size <value>       Specify the cache size (required "
+	        "argument)\n");
+	fprintf(stdout,
+	        "  --cold_cache <value>           Enable cold cache mode with "
+	        "specified cache size (required argument)\n");
+	fprintf(stdout,
+	        "  -f, --full                     Enable full mode (no argument "
+	        "required)\n");
+	fprintf(stdout,
+	        "  -h, --help                     Display this help message (no "
+	        "argument required)\n");
+	fflush(stdout);
 }
 
 void print_benchmark_opts() {
@@ -537,17 +561,18 @@ int main(int argc, char* argv[]) {
 	    {"matching", no_argument, NULL, 'm'},
 	    {"bandwidth", no_argument, NULL, 'b'},
 	    {"get", no_argument, NULL, 'g'},
-	    {"unregistered", no_argument, NULL, 'u'},
 	    {"iterations", required_argument, NULL, 'i'},
 	    {"warmup", required_argument, NULL, 'x'},
 	    {"msg_size", required_argument, NULL, 1},
 	    {"min_msg_size", required_argument, NULL, 2},
 	    {"max_msg_size", required_argument, NULL, 3},
 	    {"window-size", required_argument, NULL, 'w'},
+	    {"cache_size", required_argument, NULL, 'c'},
+	    {"cold_cache", required_argument, NULL, 4},
 	    {"full", no_argument, NULL, 'f'},
 	    {"help", no_argument, NULL, 'h'}};
 
-	const char* const short_opts = "mbgui:x:w:fh";
+	const char* const short_opts = "mbgi:x:w:c:fh";
 
 	opts.ni_mode = NON_MATCHING;
 	opts.op = PUT;
@@ -559,6 +584,8 @@ int main(int argc, char* argv[]) {
 	opts.min_msg_size = 1;
 	opts.max_msg_size = 4194304;
 	opts.event_type = COUNTING;
+	opts.cache_size = _16MiB;
+	opts.cache_state = HOT_CACHE;
 
 	while (1) {
 		const int opt = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -576,14 +603,15 @@ int main(int argc, char* argv[]) {
 			case 'g':
 				opts.op = GET;
 				break;
-			case 'u':
-				opts.memory_mode = UNREGISTERED;
-				break;
 			case 'i':
 				opts.iterations = atoi(optarg);
 				break;
 			case 'x':
 				opts.warmup = atoi(optarg);
+				break;
+			case 'c':
+				opts.cache_size = atoi(optarg);
+				opts.cache_size *= MiB;
 				break;
 			case 1:
 				opts.msg_size = atoi(optarg);
@@ -595,6 +623,9 @@ int main(int argc, char* argv[]) {
 				break;
 			case 3:
 				opts.max_msg_size = atol(optarg);
+				break;
+			case 4:
+				opts.cache_state = COLD_CACHE;
 				break;
 			case 'w':
 				opts.window_size = atol(optarg);
@@ -630,6 +661,11 @@ int main(int argc, char* argv[]) {
 	eret = init_p4_ctx(&ctx, opts.ni_mode);
 	if (PTL_OK != eret)
 		goto END;
+
+	cache_buffer = malloc(opts.cache_size);
+	if (NULL == cache_buffer)
+		goto END;
+	cache_buffer_size = opts.cache_size / sizeof(int);
 
 	eret = exchange_ni_address(&ctx, rank);
 
