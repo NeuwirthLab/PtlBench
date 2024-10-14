@@ -154,7 +154,7 @@ int main(int argc, char* argv[]) {
 
 	opts.iterations = 10;
 	opts.msg_size = 512;
-	opts.cache_size = _8MiB;
+	opts.cache_size = _16MiB;
 	opts.remote_state = COLD;
 	opts.local_state = COLD;
 
