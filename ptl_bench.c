@@ -12,7 +12,6 @@ int p4_put_latency() {
 	ptl_handle_md_t md_h;
 	ptl_handle_le_t le_h;
 	ptl_handle_me_t me_h;
-	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
 	ptl_ct_event_t zero = {.success = 0, .failure = 0};
@@ -31,18 +30,17 @@ int p4_put_latency() {
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
-		size_t bytes = opts.iterations * opts.warmup * msg_size;
-		eret = alloc_buffer_init(&buffer, bytes);
+		eret = alloc_buffer_init(&buffer, msg_size);
 		if (0 > eret)
 			return eret;
 
 		if (1 == rank) {
 			if (MATCHING == opts.ni_mode) {
-				eret =
-				    p4_me_insert_persistent(&ctx, &me_h, buffer, bytes, index);
+				eret = p4_me_insert_persistent(
+				    &ctx, &me_h, buffer, msg_size, index);
 			}
 			else {
-				eret = p4_le_insert(&ctx, &le_h, buffer, bytes, index);
+				eret = p4_le_insert(&ctx, &le_h, buffer, msg_size, index);
 			}
 			if (PTL_OK != eret) {
 				fprintf(stderr, "List entry insertion failed\n");
@@ -54,29 +52,28 @@ int p4_put_latency() {
 
 		if (0 == rank) {
 			if (COUNTING == opts.event_type)
-				eret = p4_md_alloc_ct(&ctx, &md_h, buffer, bytes);
+				eret = p4_md_alloc_ct(&ctx, &md_h, buffer, msg_size);
 			else
-				eret = p4_md_alloc_eq(&ctx, &md_h, buffer, bytes);
+				eret = p4_md_alloc_eq(&ctx, &md_h, buffer, msg_size);
 			if (PTL_OK != eret) {
 				free(buffer);
-				fprintf(stderr,"md alloc failed with %i\n",eret);
+				fprintf(stderr, "md alloc failed with %i\n", eret);
 				return eret;
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
-				offset = msg_size * i;
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
 
 				eret = PtlPut(md_h,
-				              offset,
+				              0,
 				              msg_size,
 				              PTL_ACK_REQ,
 				              ctx.peer_addr,
 				              index,
 				              match_bits,
-				              offset,
+				              0,
 				              NULL,
 				              0);
 
@@ -113,10 +110,10 @@ int p4_put_latency() {
 					fflush(stdout);
 				}
 			}
-			if(0 == rank && COUNTING == opts.event_type){
-				eret = PtlCTSet(ctx.ct_h,zero);
-				if(PTL_OK != eret){
-					fprintf(stderr,"PtlCTSet failed %i\n",eret);
+			if (0 == rank && COUNTING == opts.event_type) {
+				eret = PtlCTSet(ctx.ct_h, zero);
+				if (PTL_OK != eret) {
+					fprintf(stderr, "PtlCTSet failed %i\n", eret);
 					return eret;
 				}
 			}
@@ -139,7 +136,6 @@ int p4_get_latency() {
 	ptl_handle_md_t md_h;
 	ptl_handle_le_t le_h;
 	ptl_handle_me_t me_h;
-	ptl_size_t offset;
 	ptl_index_t index;
 	ptl_ct_event_t ct_event;
 	ptl_ct_event_t zero = {.success = 0, .failure = 0};
@@ -157,17 +153,16 @@ int p4_get_latency() {
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
-		size_t bytes = opts.iterations * opts.warmup * msg_size;
-		eret = alloc_buffer_init(&buffer, bytes);
+		eret = alloc_buffer_init(&buffer, msg_size);
 		if (0 > eret)
 			return eret;
 
 		if (1 == rank) {
 			if (MATCHING == opts.ni_mode) {
-				p4_me_insert_persistent(&ctx, &me_h, buffer, bytes, index);
+				p4_me_insert_persistent(&ctx, &me_h, buffer, msg_size, index);
 			}
 			else {
-				p4_le_insert(&ctx, &le_h, buffer, bytes, index);
+				p4_le_insert(&ctx, &le_h, buffer, msg_size, index);
 			}
 		}
 
@@ -175,27 +170,26 @@ int p4_get_latency() {
 
 		if (0 == rank) {
 			if (COUNTING == opts.event_type)
-				eret = p4_md_alloc_ct(&ctx, &md_h, buffer, bytes);
+				eret = p4_md_alloc_ct(&ctx, &md_h, buffer, msg_size);
 			else
-				eret = p4_md_alloc_eq(&ctx, &md_h, buffer, bytes);
+				eret = p4_md_alloc_eq(&ctx, &md_h, buffer, msg_size);
 			if (PTL_OK != eret) {
 				free(buffer);
 				return eret;
 			}
 
 			for (int i = 0; i < opts.iterations + opts.warmup; ++i) {
-				offset = msg_size * i;
 				if (i >= opts.warmup) {
 					t0 = MPI_Wtime();
 				}
 
 				eret = PtlGet(md_h,
-				              offset,
+				              0,
 				              msg_size,
 				              ctx.peer_addr,
 				              index,
 				              match_bits,
-				              offset,
+				              0,
 				              NULL);
 				if (PTL_OK != eret) {
 					p4_md_free(md_h);
@@ -224,10 +218,10 @@ int p4_get_latency() {
 					fflush(stdout);
 				}
 			}
-			if(0 == rank && COUNTING == opts.event_type){
-				eret = PtlCTSet(ctx.ct_h,zero);
-				if(PTL_OK != eret){
-					fprintf(stderr,"PtlCTSet failed with %i\n");
+			if (0 == rank && COUNTING == opts.event_type) {
+				eret = PtlCTSet(ctx.ct_h, zero);
+				if (PTL_OK != eret) {
+					fprintf(stderr, "PtlCTSet failed with %i\n");
 					return eret;
 				}
 			}
@@ -268,8 +262,7 @@ int p4_put_bandwidth() {
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
-		size_t bytes =
-		    opts.iterations * opts.warmup * opts.window_size * msg_size;
+		size_t bytes = opts.window_size * msg_size;
 		eret = alloc_buffer_init(&buffer, bytes);
 		if (0 > eret)
 			return eret;
@@ -300,7 +293,7 @@ int p4_put_bandwidth() {
 					t0 = MPI_Wtime();
 				}
 				for (int w = 0; w < opts.window_size; ++w) {
-					offset = (i * opts.window_size + w) * msg_size;
+					offset = w * msg_size;
 					eret = PtlPut(md_h,
 					              offset,
 					              msg_size,
@@ -345,10 +338,10 @@ int p4_put_bandwidth() {
 					fflush(stdout);
 				}
 			}
-			if(0 == rank && COUNTING == opts.event_type){
-				eret = PtlCTSet(ctx.ct_h,zero);
-				if(PTL_OK != eret){
-					fprintf(stderr,"PtlCTSet failed with %i\n");
+			if (0 == rank && COUNTING == opts.event_type) {
+				eret = PtlCTSet(ctx.ct_h, zero);
+				if (PTL_OK != eret) {
+					fprintf(stderr, "PtlCTSet failed with %i\n");
 					return eret;
 				}
 			}
@@ -389,8 +382,7 @@ int p4_get_bandwidth() {
 
 	for (size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
 	     msg_size *= 2) {
-		size_t bytes =
-		    opts.iterations * opts.warmup * opts.window_size * msg_size;
+		size_t bytes = opts.window_size * msg_size;
 		eret = alloc_buffer_init(&buffer, bytes);
 		if (0 > eret)
 			return eret;
@@ -421,7 +413,7 @@ int p4_get_bandwidth() {
 					t0 = MPI_Wtime();
 				}
 				for (int w = 0; w < opts.window_size; ++w) {
-					offset = (i * opts.window_size + w) * msg_size;
+					offset = w * msg_size;
 					eret = PtlGet(md_h,
 					              offset,
 					              msg_size,
@@ -462,10 +454,10 @@ int p4_get_bandwidth() {
 					fflush(stdout);
 				}
 			}
-			if(0 == rank && COUNTING == opts.event_type){
-				eret = PtlCTSet(ctx.ct_h,zero);
-				if(PTL_OK != eret){
-					fprintf(stderr,"PtlCTSet failed with %i\n");
+			if (0 == rank && COUNTING == opts.event_type) {
+				eret = PtlCTSet(ctx.ct_h, zero);
+				if (PTL_OK != eret) {
+					fprintf(stderr, "PtlCTSet failed with %i\n");
 					return eret;
 				}
 			}
