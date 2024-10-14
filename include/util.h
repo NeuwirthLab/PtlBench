@@ -4,7 +4,7 @@
 #include "common.h"
 
 #define MiB 1024UL * 1024UL
-#define _8MiB 8 * MiB
+#define _16MiB 16 * MiB
 
 int init_p4_ctx(p4_ctx_t* const ctx, const ni_mode_t mode);
 void destroy_p4_ctx(p4_ctx_t* const ctx);

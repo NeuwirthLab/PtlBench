@@ -13,22 +13,23 @@
 typedef enum { MATCHING = 1, NON_MATCHING } ni_mode_t;
 typedef enum { LATENCY = 1, BANDWIDTH } benchmark_type_t;
 typedef enum { PUT = 1, GET } operation_t;
-typedef enum { REGISTERED = 1, UNREGISTERED } memory_mode_t;
 typedef enum { COUNTING = 1, FULL } event_type_t;
 typedef enum { COLD = 1, HOT } page_state_t;
+typedef enum { COLD_CACHE = 1, HOT_CACHE } cache_state_t;
 
 typedef struct {
 	ni_mode_t ni_mode;
 	benchmark_type_t type;
 	operation_t op;
-	memory_mode_t memory_mode;
 	event_type_t event_type;
+	cache_state_t cache_state;
 	int iterations;
 	int warmup;
 	int window_size;
 	size_t msg_size;
 	size_t min_msg_size;
 	size_t max_msg_size;
+	size_t cache_size;
 } benchmark_opts_t;
 
 typedef struct {
