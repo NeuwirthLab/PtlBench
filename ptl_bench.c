@@ -517,13 +517,13 @@ void print_help_message() {
 	        "  --max_msg_size <value>         Specify the maximum message size "
 	        "(required argument)\n");
 	fprintf(stdout,
-	        "  -w, --window-size <value>      Specify the window size "
+	        "  -w, --window_size <value>      Specify the window size "
 	        "(required argument)\n");
 	fprintf(stdout,
 	        "  -c, --cache_size <value>       Specify the cache size (required "
 	        "argument)\n");
 	fprintf(stdout,
-	        "  --cold_cache <value>           Enable cold cache mode with "
+	        "  --cold_cache 	              Enable cold cache mode with "
 	        "specified cache size (required argument)\n");
 	fprintf(stdout,
 	        "  -f, --full                     Enable full mode (no argument "
@@ -541,7 +541,7 @@ void print_benchmark_opts() {
 	        opts.ni_mode == MATCHING ? "MATCHING" : "NON MATCHING");
 	fprintf(stderr, "op: %s\n", opts.op == PUT ? "PUT" : "GET");
 	fprintf(
-	    stdout, "type: %s\n", opts.type == LATENCY ? "LATENCY" : "BANDWIDTH");
+	    stderr, "type: %s\n", opts.type == LATENCY ? "LATENCY" : "BANDWIDTH");
 	fprintf(stderr,
 	        "event_type: %s\n",
 	        opts.event_type == COUNTING ? "COUNTING" : "FULL");
@@ -550,7 +550,11 @@ void print_benchmark_opts() {
 	fprintf(stderr, "window_size: %i\n", opts.window_size);
 	fprintf(stderr, "msg_size: %i\n", opts.msg_size);
 	fprintf(stderr, "min_msg_size: %i\n", opts.min_msg_size);
-	fprintf(stderr, "max_msg_size: %i\n\n", opts.max_msg_size);
+	fprintf(stderr, "max_msg_size: %i\n", opts.max_msg_size);
+	fprintf(stderr, "cache_size: %lu\n", opts.cache_size);
+	fprintf(stderr,
+	        "cache_state: %s\n\n",
+	        opts.cache_state == COLD_CACHE ? "COLD_CACHE" : "HOT_CACHE");
 	fflush(stderr);
 }
 
@@ -566,9 +570,9 @@ int main(int argc, char* argv[]) {
 	    {"msg_size", required_argument, NULL, 1},
 	    {"min_msg_size", required_argument, NULL, 2},
 	    {"max_msg_size", required_argument, NULL, 3},
-	    {"window-size", required_argument, NULL, 'w'},
+	    {"window_size", required_argument, NULL, 'w'},
 	    {"cache_size", required_argument, NULL, 'c'},
-	    {"cold_cache", required_argument, NULL, 4},
+	    {"cold_cache", no_argument, NULL, 4},
 	    {"full", no_argument, NULL, 'f'},
 	    {"help", no_argument, NULL, 'h'}};
 
