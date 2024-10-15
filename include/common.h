@@ -16,6 +16,7 @@ typedef enum { PUT = 1, GET } operation_t;
 typedef enum { COUNTING = 1, FULL } event_type_t;
 typedef enum { COLD = 1, HOT } page_state_t;
 typedef enum { COLD_CACHE = 1, HOT_CACHE } cache_state_t;
+typedef enum { ONE_SIDED = 1, PINGPONG } latency_pattern_t;
 
 typedef struct {
 	ni_mode_t ni_mode;
@@ -39,6 +40,9 @@ typedef struct {
 	size_t cache_size;
 	page_state_t local_state;
 	page_state_t remote_state;
+	operation_t op;
+	latency_pattern_t pattern;
+
 } memory_benchmark_opts_t;
 
 typedef struct {

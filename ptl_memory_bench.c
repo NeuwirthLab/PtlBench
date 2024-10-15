@@ -14,6 +14,10 @@ static char processor_name[MPI_MAX_PROCESSOR_NAME];
 int* cache_buffer;
 size_t cache_buffer_size;
 void** page_buffer;
+int (*communicate)(const ptl_handle_md_t md_h,
+                   const ptl_size_t offset,
+                   const ptl_index_t index,
+                   const ptl_ack_req_t req_type);
 
 int get_random_index() {
 	int blocks = page_size / opts.msg_size;
@@ -47,12 +51,44 @@ void free_cold_pages(const int n_pages) {
 	}
 }
 
-void run_benchmark() {
+int put_operation(const ptl_handle_md_t md_h,
+                  const ptl_size_t offset,
+                  const ptl_index_t index,
+                  const ptl_ack_req_t req_type) {
+	int eret = -1;
+	eret = PtlPut(md_h,
+	              offset,
+	              opts.msg_size,
+	              req_type,
+	              ctx.peer_addr,
+	              index,
+	              0,
+	              offset,
+	              NULL,
+	              0);
+	return eret;
+}
+
+int get_operation(const ptl_handle_md_t md_h,
+                  const ptl_size_t offset,
+                  const ptl_index_t index,
+                  const ptl_ack_req_t req_type) {
+	int eret = -1;
+
+	eret = PtlGet(
+	    md_h, offset, opts.msg_size, ctx.peer_addr, index, 0, offset, NULL);
+
+	return eret;
+}
+
+void run_one_sided_benchmark() {
 	ptl_handle_le_t le_h;
 	ptl_handle_md_t md_h;
 	ptl_index_t index;
 	ptl_event_t event;
 	int eret = -1;
+
+	communicate = opts.op == PUT ? &put_operation : &get_operation;
 
 	p4_pt_alloc(&ctx, &index);
 
@@ -85,16 +121,8 @@ void run_benchmark() {
 			invalidate_cache(cache_buffer, cache_buffer_size);
 
 			double t0 = MPI_Wtime();
-			eret = PtlPut(md_h,
-			              block_offset,
-			              opts.msg_size,
-			              PTL_ACK_REQ,
-			              ctx.peer_addr,
-			              index,
-			              0,
-			              block_offset,
-			              NULL,
-			              0);
+
+			communicate(md_h, block_offset, index, PTL_ACK_REQ);
 
 			PtlEQWait(ctx.eq_h, &event);
 			if (PTL_NI_OK != event.ni_fail_type) {
@@ -115,6 +143,79 @@ void run_benchmark() {
 			p4_le_remove(le_h);
 		}
 		free_cold_pages(1);
+	}
+	p4_pt_free(&ctx, index);
+}
+
+void run_ping_pong_benchmark() {
+	ptl_handle_le_t le_h;
+	ptl_handle_md_t md_h;
+	ptl_index_t index;
+	ptl_event_t event;
+	int eret = -1;
+
+	communicate = &put_operation;
+
+	p4_pt_alloc(&ctx, &index);
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	if (0 == rank) {
+		// print header
+		fprintf(stdout,
+		        "local_page_state,remote_page_state,msg_size,latency\n");
+	}
+
+	for (int i = 0; i < opts.iterations; ++i) {
+		get_cold_pages(1);
+
+		p4_le_insert_full_comm(&ctx, &le_h, page_buffer[0], page_size, index);
+		if (1 == rank && HOT == opts.remote_state) {
+			touch_cold_pages(1);
+		}
+		p4_md_alloc_eq(&ctx, &md_h, page_buffer[0], page_size);
+		if (0 == rank && HOT == opts.local_state) {
+			touch_cold_pages(1);
+		}
+
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		if (0 == rank) {
+			ptl_size_t block_offset = get_random_index() * opts.msg_size;
+			invalidate_cache(cache_buffer, cache_buffer_size);
+
+			double t0 = MPI_Wtime();
+
+			communicate(md_h, block_offset, index, PTL_NO_ACK_REQ);
+
+			PtlEQWait(ctx.eq_h, &event);
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "PtlPut failed with %i\n", event.ni_fail_type);
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+
+			double t = MPI_Wtime() - t0;
+			fprintf(stdout,
+			        "%s,%s,%i,%.4f\n",
+			        opts.local_state == COLD ? "cold" : "hot",
+			        opts.remote_state == COLD ? "cold" : "hot",
+			        opts.msg_size,
+			        t * 1e6);
+		}
+		else {
+			PtlEQWait(ctx.eq_h, &event);
+			if (PTL_NI_OK != event.ni_fail_type) {
+				fprintf(stderr, "PtlPut failed with %i\n", event.ni_fail_type);
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+
+			communicate(md_h, event.remote_offset, index, PTL_NO_ACK_REQ);
+		}
+
+		MPI_Barrier(MPI_COMM_WORLD);
+		p4_md_free(md_h);
+		p4_le_remove(le_h);
+		free_cold_pages(2);
 	}
 	p4_pt_free(&ctx, index);
 }
@@ -147,16 +248,20 @@ int main(int argc, char* argv[]) {
 	    {"cache-size", required_argument, NULL, 'c'},
 	    {"local-hot", no_argument, NULL, 'l'},
 	    {"remote-hot", no_argument, NULL, 'r'},
+	    {"get", no_argument, NULL, 'g'},
 	    {"msg_size", required_argument, NULL, 'm'},
+	    {"ping_pong", no_argument, NULL, 'p'},
 	    {"help", no_argument, NULL, 'h'}};
 
-	const char* const short_opts = "i:c:m:lrh";
+	const char* const short_opts = "i:c:m:lrpgh";
 
 	opts.iterations = 10;
 	opts.msg_size = 512;
 	opts.cache_size = _16MiB;
 	opts.remote_state = COLD;
 	opts.local_state = COLD;
+	opts.op = PUT;
+	opts.pattern = ONE_SIDED;
 
 	while (1) {
 		const int opt = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -173,6 +278,12 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'm':
 				opts.msg_size = atoi(optarg);
+				break;
+			case 'g':
+				opts.op = GET;
+				break;
+			case 'p':
+				opts.pattern = PINGPONG;
 				break;
 			case 'l':
 				opts.local_state = HOT;
@@ -228,7 +339,10 @@ int main(int argc, char* argv[]) {
 
 	srand(time(0));
 
-	run_benchmark();
+	if (ONE_SIDED == opts.pattern)
+		run_one_sided_benchmark();
+	else if (PINGPONG == opts.pattern)
+		run_ping_pong_benchmark();
 
 END:
 	free(cache_buffer);

@@ -177,6 +177,38 @@ int p4_le_insert(p4_ctx_t* const ctx,
 	return eret;
 }
 
+int p4_le_insert_full_comm(p4_ctx_t* const ctx,
+                 ptl_handle_le_t* const le_h,
+                 void* const start,
+                 const ptl_size_t length,
+                 const ptl_index_t index) {
+	int eret = -1;
+	ptl_event_t event;
+
+	ptl_le_t le = {.start = start,
+	               .length = length,
+	               .options = PTL_LE_OP_GET | PTL_LE_OP_PUT |
+	                          PTL_LE_EVENT_UNLINK_DISABLE,
+	               .uid = PTL_UID_ANY,
+	               .ct_handle = PTL_CT_NONE};
+
+	eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
+	if (PTL_OK != eret)
+		return eret;
+
+	PtlEQWait(ctx->eq_h, &event);
+
+	if (PTL_EVENT_LINK != event.type) {
+		fprintf(stderr, "Failed to link LE\n");
+		return -1;
+	}
+	if (PTL_NI_OK != event.ni_fail_type) {
+		fprintf(stderr, "ni_fail_type != PTL_NI_OK");
+		return -1;
+	}
+	return eret;
+}
+
 int p4_le_insert_empty(p4_ctx_t* const ctx,
                        ptl_handle_le_t* const le_h,
                        const ptl_index_t index) {
