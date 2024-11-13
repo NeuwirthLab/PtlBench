@@ -178,19 +178,19 @@ int p4_le_insert(p4_ctx_t* const ctx,
 }
 
 int p4_le_insert_full_comm(p4_ctx_t* const ctx,
-                 ptl_handle_le_t* const le_h,
-                 void* const start,
-                 const ptl_size_t length,
-                 const ptl_index_t index) {
+                           ptl_handle_le_t* const le_h,
+                           void* const start,
+                           const ptl_size_t length,
+                           const ptl_index_t index) {
 	int eret = -1;
 	ptl_event_t event;
 
-	ptl_le_t le = {.start = start,
-	               .length = length,
-	               .options = PTL_LE_OP_GET | PTL_LE_OP_PUT |
-	                          PTL_LE_EVENT_UNLINK_DISABLE,
-	               .uid = PTL_UID_ANY,
-	               .ct_handle = PTL_CT_NONE};
+	ptl_le_t le = {
+	    .start = start,
+	    .length = length,
+	    .options = PTL_LE_OP_GET | PTL_LE_OP_PUT | PTL_LE_EVENT_UNLINK_DISABLE,
+	    .uid = PTL_UID_ANY,
+	    .ct_handle = PTL_CT_NONE};
 
 	eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
 	if (PTL_OK != eret)
@@ -306,4 +306,21 @@ void invalidate_cache(int* const cache_buffer, const size_t elements) {
 	for (size_t i = 1; i < elements; ++i) {
 		cache_buffer[i] = cache_buffer[i - 1];
 	}
+}
+
+int set_cache_regions(const int pids) {
+	int eret = -1;
+	FILE* fptr;
+
+	fptr = fopen("/sys/class/bxi/bxi0/v2p/cache_pids", "w");
+
+	if (fptr == NULL) {
+		printf(
+		    "The file is not opened. The program will "
+		    "now exit.");
+		return -1;
+	}
+
+	fprintf(fptr, "%i", pids);
+	return fclose(fptr);
 }

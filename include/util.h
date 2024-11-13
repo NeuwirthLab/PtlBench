@@ -43,4 +43,5 @@ int p4_le_insert_full_comm(p4_ctx_t* const ctx,
                            const ptl_index_t index);
 int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h);
 void invalidate_cache(int* const cache_buffer, const size_t elements);
+int set_cache_regions(const int pids);
 #endif

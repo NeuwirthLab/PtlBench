@@ -574,9 +574,10 @@ int main(int argc, char* argv[]) {
 	    {"cache_size", required_argument, NULL, 'c'},
 	    {"cold_cache", no_argument, NULL, 4},
 	    {"full", no_argument, NULL, 'f'},
+	    {"pids", required_argument, NULL, 'p'},
 	    {"help", no_argument, NULL, 'h'}};
 
-	const char* const short_opts = "mbgi:x:w:c:fh";
+	const char* const short_opts = "mbgi:x:w:c:fp:h";
 
 	opts.ni_mode = NON_MATCHING;
 	opts.op = PUT;
@@ -616,6 +617,9 @@ int main(int argc, char* argv[]) {
 			case 'c':
 				opts.cache_size = atoi(optarg);
 				opts.cache_size *= MiB;
+				break;
+			case 'p':
+				set_cache_regions(atoi(optarg));
 				break;
 			case 1:
 				opts.msg_size = atoi(optarg);
