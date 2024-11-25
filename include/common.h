@@ -42,7 +42,6 @@ typedef struct {
 	page_state_t remote_state;
 	operation_t op;
 	latency_pattern_t pattern;
-
 } memory_benchmark_opts_t;
 
 typedef struct {
