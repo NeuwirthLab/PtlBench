@@ -325,6 +325,8 @@ int main(int argc, char* argv[]) {
 		goto END;
 	cache_buffer_size = opts.cache_size / sizeof(int);
 
+	set_cache_regions(1);
+
 	if (triggered)
 		run_triggered_ping_pong_benchmark();
 	else
