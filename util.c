@@ -2,6 +2,8 @@
 #include <limits.h>
 #include "common.h"
 
+#define REQUESTED_INDEX 99
+
 int init_p4_ctx(p4_ctx_t* const ctx, const ni_mode_t mode) {
 	int eret = -1;
 	unsigned int ni_matching =
@@ -98,7 +100,7 @@ int exchange_ni_address(p4_ctx_t* const ctx, const int my_rank) {
 }
 
 int p4_pt_alloc(p4_ctx_t* const ctx, ptl_index_t* const index) {
-	return PtlPTAlloc(ctx->ni_h, 0, ctx->eq_h, 0, index);
+	return PtlPTAlloc(ctx->ni_h, 0, ctx->eq_h, REQUESTED_INDEX, index);
 }
 
 void p4_pt_free(p4_ctx_t* const ctx, ptl_index_t index) {
@@ -318,8 +320,66 @@ int p4_me_insert_persistent(p4_ctx_t* const ctx,
 	return eret;
 }
 
-//int p4_me_list(p4_ctx_t * const ctx, ptl_handle_me_t * const me_h, void * const start, const ptl_size_t length, const ptl_index_t index){
-//}
+int __p4_me_insert(p4_ctx_t* const ctx,
+                   ptl_handle_me_t* const me_h,
+                   void* start,
+                   const ptl_size_t length,
+                   const ptl_index_t index,
+                   const ptl_handle_ct_t ct_handle,
+                   const ptl_match_bits_t match_bits) {
+	int eret = -1;
+	ptl_event_t event;
+	ptl_process_t src;
+
+	src.phys.nid = PTL_NID_ANY;
+	src.phys.pid = PTL_PID_ANY;
+
+	ptl_me_t me = {
+	    .start = start,
+	    .length = length,
+	    .options = PTL_ME_OP_GET | PTL_ME_OP_PUT | PTL_ME_EVENT_COMM_DISABLE |
+	               PTL_ME_EVENT_UNLINK_DISABLE | PTL_ME_IS_ACCESSIBLE,
+	    .ct_handle = ct_handle,
+	    .uid = PTL_UID_ANY,
+	    .match_id = src,
+	    .match_bits = match_bits,
+	    .ignore_bits = 0,
+	    .min_free = 0};
+
+	eret = PtlMEAppend(ctx->ni_h, index, &me, PTL_PRIORITY_LIST, NULL, me_h);
+	if (PTL_OK != eret)
+		return eret;
+
+	PtlEQWait(ctx->eq_h, &event);
+
+	if (PTL_EVENT_LINK != event.type) {
+		fprintf(stderr, "Failed to link LE\n");
+		return -1;
+	}
+	if (PTL_NI_OK != event.ni_fail_type) {
+		fprintf(stderr, "ni_fail_type != PTL_NI_OK");
+		return -1;
+	}
+	return eret;
+}
+
+int p4_me_insert_list(p4_ctx_t* const ctx,
+                      ptl_handle_me_t* const me_h,
+                      void* const* start,
+                      ptl_size_t* const length,
+                      const int num_entries,
+                      const ptl_index_t index,
+                      const ptl_handle_ct_t ct_handle) {
+	int eret = -1;
+	ptl_match_bits_t match_bits = 1;
+	for (int i = 0; i < num_entries; ++i) {
+		eret = __p4_me_insert(
+		    ctx, &me_h[i], start[i], length[i], index, ct_handle, match_bits++);
+		if (eret < 0)
+			return -1;
+	}
+	return 0;
+}
 
 void p4_me_remove(ptl_handle_me_t me_h) {
 	PtlMEUnlink(me_h);
@@ -348,9 +408,9 @@ int set_cache_regions(const int pids) {
 	fptr = fopen("/sys/class/bxi/bxi0/v2p/cache_pids", "w");
 
 	if (fptr == NULL) {
-		printf(
-		    "The file is not opened. The program will "
-		    "now exit.");
+		fprintf(stderr,
+		        "The file is not opened. The program will "
+		        "now exit.");
 		return -1;
 	}
 
