@@ -215,7 +215,7 @@ void run_ping_pong_benchmark() {
 		MPI_Barrier(MPI_COMM_WORLD);
 		p4_md_free(md_h);
 		p4_le_remove(le_h);
-		free_cold_pages(2);
+		free_cold_pages(1);
 	}
 	p4_pt_free(&ctx, index);
 }
