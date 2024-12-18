@@ -95,7 +95,7 @@ void run_one_sided_benchmark() {
 	if (0 == rank) {
 		// print header
 		fprintf(stdout,
-		        "local_page_state,remote_page_state,msg_size,latency\n");
+		        "op,benchmark,local_page_state,remote_page_state,msg_size,latency\n");
 	}
 
 	for (int i = 0; i < opts.iterations; ++i) {
@@ -131,7 +131,9 @@ void run_one_sided_benchmark() {
 			}
 			double t = MPI_Wtime() - t0;
 			fprintf(stdout,
-			        "%s,%s,%i,%.4f\n",
+			        "%s,%s,%s,%s,%i,%.4f\n",
+				opts.op == PUT ? "PtlPut" : "PtlGet",
+				"one_sided",
 			        opts.local_state == COLD ? "cold" : "hot",
 			        opts.remote_state == COLD ? "cold" : "hot",
 			        opts.msg_size,
@@ -163,7 +165,7 @@ void run_ping_pong_benchmark() {
 	if (0 == rank) {
 		// print header
 		fprintf(stdout,
-		        "local_page_state,remote_page_state,msg_size,latency\n");
+		        "op,benchmark,local_page_state,remote_page_state,msg_size,latency\n");
 	}
 
 	for (int i = 0; i < opts.iterations; ++i) {
@@ -196,7 +198,9 @@ void run_ping_pong_benchmark() {
 
 			double t = MPI_Wtime() - t0;
 			fprintf(stdout,
-			        "%s,%s,%i,%.4f\n",
+			        "%s,%s,%s,%s,%i,%.4f\n",
+				"PtlPut",
+				"ping_pong",
 			        opts.local_state == COLD ? "cold" : "hot",
 			        opts.remote_state == COLD ? "cold" : "hot",
 			        opts.msg_size,

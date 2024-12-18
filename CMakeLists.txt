@@ -19,3 +19,10 @@ target_compile_features(ptl_ping_pong PRIVATE "c_std_11")
 target_include_directories(ptl_ping_pong PUBLIC "./include")
 target_link_libraries(ptl_ping_pong PUBLIC "Portals::Portals" "MPI::MPI_C")
 
+add_executable(ptl_me_none_persistent "ptl_me_none_persistent.c" "util.c")
+target_compile_features(ptl_me_none_persistent PRIVATE "c_std_11")
+target_include_directories(ptl_me_none_persistent PUBLIC "./include")
+target_link_libraries(ptl_me_none_persistent PUBLIC "Portals::Portals" "MPI::MPI_C")
+
+add_executable(pf_bench "page_fault.c")
+target_compile_features(pf_bench PRIVATE "c_std_11")

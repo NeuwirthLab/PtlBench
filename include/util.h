@@ -1,7 +1,7 @@
 #ifndef __UTIL_H__
 #define __UTIL_H__
-#include <portals4.h>
 #include "common.h"
+#include <portals4.h>
 
 #define MiB 1024UL * 1024UL
 #define _16MiB 16 * MiB
@@ -11,40 +11,31 @@ void destroy_p4_ctx(p4_ctx_t* const ctx);
 int exchange_ni_address(p4_ctx_t* const ctx, const int my_rank);
 int p4_pt_alloc(p4_ctx_t* const ctx, ptl_index_t* const index);
 void p4_pt_free(p4_ctx_t* const ctx, ptl_index_t index);
-int p4_md_alloc_ct(p4_ctx_t* const ctx,
-                   ptl_handle_md_t* const md_h,
-                   void* const start,
-                   const ptl_size_t length);
-int p4_md_alloc_eq(p4_ctx_t* const ctx,
-                   ptl_handle_md_t* const md_h,
-                   void* const start,
-                   const ptl_size_t length);
+int p4_md_alloc_ct(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h,
+                   void* const start, const ptl_size_t length);
+int p4_md_alloc_eq(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h,
+                   void* const start, const ptl_size_t length);
 void p4_md_free(ptl_handle_md_t md_h);
-int p4_le_insert(p4_ctx_t* const ctx,
-                 ptl_handle_le_t* const le_h,
-                 void* const start,
-                 const ptl_size_t length,
+int p4_le_insert(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
+                 void* const start, const ptl_size_t length,
                  const ptl_index_t index);
 void p4_le_remove(ptl_handle_le_t le_h);
-int p4_me_insert_persistent(p4_ctx_t* const ctx,
-                            ptl_handle_me_t* const me_h,
-                            void* const start,
-                            const ptl_size_t length,
+int p4_me_insert_persistent(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
+                            void* const start, const ptl_size_t length,
                             const ptl_index_t index);
+int p4_me_insert_list_use_once(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
+                               void* const* start, ptl_size_t* const length,
+                               const int num_entries, const ptl_index_t index,
+                               const ptl_handle_ct_t ct_handle);
 void p4_me_remove(ptl_handle_me_t me_h);
 int alloc_buffer_init(void** ptr, size_t bytes);
-int p4_le_insert_empty(p4_ctx_t* const ctx,
-                       ptl_handle_le_t* const le_h,
+int p4_le_insert_empty(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
                        const ptl_index_t index);
-int p4_le_insert_full_comm(p4_ctx_t* const ctx,
-                           ptl_handle_le_t* const le_h,
-                           void* const start,
-                           const ptl_size_t length,
+int p4_le_insert_full_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
+                           void* const start, const ptl_size_t length,
                            const ptl_index_t index);
-int p4_le_insert_ct_comm(p4_ctx_t* const ctx,
-                         ptl_handle_le_t* const le_h,
-                         void* const start,
-                         const ptl_size_t length,
+int p4_le_insert_ct_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
+                         void* const start, const ptl_size_t length,
                          const ptl_index_t index);
 int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h);
 void invalidate_cache(int* const cache_buffer, const size_t elements);
