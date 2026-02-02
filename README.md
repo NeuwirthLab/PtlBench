@@ -105,12 +105,14 @@ Options:
 
 ### Cite as
 If you use **PtlBench** in your research or publications, please cite the following paper:  
-> ```bibtex
-> @article{bartelheimer_comprehensive_nodate,
->   title   = {Comprehensive Performance Analysis of Portals4 Communication Primitives on BXI Hardware},
->   author  = {Bartelheimer, Niklas J and Neuwirth, Sarah M},
->   abstract= {This paper presents a comprehensive performance analysis of the BullSequana eXascale Interconnect (BXI) using the Portals4 programming model. The main contributions include: (1) the design and implementation of PtlBench, a Portals4 microbenchmark suite that evaluates low-level features such as bandwidth, latency, cache effects, and triggered operations; (2) a detailed comparison of Portals4-compatible MPI implementations (OpenMPI, ParaStationMPI) and our custom Portals4 device for the PGAS library GPI-2, covering point-to-point, one-sided, and collective operations; and (3) application-level analysis using the Himeno and SSCA1 benchmarks to assess the impact on different communication patterns. These results provide valuable information on BXI’s capabilities and limitations for real-world HPC workloads and communication models.},
->   language= {en}
-> }
-> ```
+```bibtex
+@INPROCEEDINGS{Bartelheimer_2025,
+  author={Bartelheimer, Niklas J. and Neuwirth, Sarah M.},
+  booktitle={2025 33rd International Symposium on Modeling, Analysis and Simulation of Computer and Telecommunication Systems (MASCOTS)}, 
+  title={Comprehensive Performance Analysis of Portals4 Communication Primitives on BXI Hardware}, 
+  year={2025},
+  pages={1-8},
+  keywords={Analytical models;Computational modeling;Bandwidth;Benchmark testing;Libraries;Hardware;Performance analysis;Telecommunications;Electronics packaging;MPI;GASPI;PGAS;BXI;Portals4;Performance Study;Benchmarking;Performance Analysis},
+  doi={10.1109/MASCOTS67699.2025.11283317}}
+```
 
