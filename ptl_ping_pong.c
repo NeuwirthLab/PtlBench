@@ -1,46 +1,58 @@
 #include "common.h"
 #include "util.h"
-#include <assert.h>
 #include <getopt.h>
-#include <sys/mman.h>
-#include <time.h>
 
+static int table_output;
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
 static benchmark_opts_t opts;
 static char processor_name[MPI_MAX_PROCESSOR_NAME];
-int* cache_buffer;
-size_t cache_buffer_size;
 
 void
 run_triggered_ping_pong_benchmark()
 {
   ptl_handle_le_t le_h;
   ptl_handle_md_t md_h;
-  ptl_index_t index;
-  ptl_ct_event_t event;
+  ptl_pt_index_t index;
+  ptl_handle_ct_t send_ct;
+  void* send_buffer = NULL;
   int eret = -1;
   void* buffer = NULL;
 
   double t0;
-  double* rtt = malloc(opts.iterations * opts.warmup * sizeof(double));
-  double* setup = malloc(opts.iterations * opts.warmup * sizeof(double));
+  double* rtt =
+      malloc((size_t)(opts.iterations + opts.warmup) * sizeof(double));
+  double* setup =
+      malloc((size_t)(opts.iterations + opts.warmup) * sizeof(double));
+  if(!rtt || !setup)
+    bench_fail("Sample allocation failed");
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
   {
-    MPI_Abort(MPI_COMM_WORLD, -1);
+    P4_CHECK(eret);
   }
 
   if(0 == rank)
   {
-    fprintf(stdout, "n,func,msg_size,rtt,setup_time\n");
+    fprintf(stdout, table_output ? "Sample  Operation              Bytes       "
+                                   "RTT (us)     Setup (us)\n"
+                                 : "n,func,msg_size,rtt,setup_time\n");
   }
 
   alloc_buffer_init(&buffer, opts.msg_size);
-  p4_le_insert_ct_comm(&ctx, &le_h, buffer, opts.msg_size, index);
-  p4_md_alloc_ct(&ctx, &md_h, buffer, opts.msg_size);
+  memset(buffer, 'r', opts.msg_size);
+  alloc_buffer_init(&send_buffer, opts.msg_size);
+  P4_CHECK(p4_le_insert_ct_comm(&ctx, &le_h, buffer, opts.msg_size, index));
+  P4_CHECK(PtlCTAlloc(ctx.ni_h, &send_ct));
+  // Count local sends separately: they must never advance receive triggers.
+  ptl_md_t md = {.start = send_buffer,
+                 .length = opts.msg_size,
+                 .options = PTL_MD_EVENT_CT_SEND | PTL_MD_EVENT_SUCCESS_DISABLE,
+                 .ct_handle = send_ct,
+                 .eq_handle = PTL_EQ_NONE};
+  P4_CHECK(PtlMDBind(ctx.ni_h, &md, &md_h));
 
   if(1 == rank)
   {
@@ -52,13 +64,13 @@ run_triggered_ping_pong_benchmark()
       if(PTL_OK != eret)
       {
         fprintf(stderr, "PtlTriggeredPut failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
+        P4_CHECK(eret);
       }
       setup[i - 1] = (MPI_Wtime() - t0) * 1e6;
     }
   }
 
-  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   for(int i = 1; i <= opts.iterations + opts.warmup; ++i)
   {
@@ -71,43 +83,41 @@ run_triggered_ping_pong_benchmark()
       if(PTL_OK != eret)
       {
         fprintf(stderr, "PtlPut failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
+        P4_CHECK(eret);
       }
-      eret = PtlCTWait(ctx.ct_h, i, &event);
-      if(PTL_OK != eret)
-      {
-        fprintf(stderr, "PtlCTWait failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
-      }
-
-      assert(0 == event.failure);
-      assert(i == event.success);
+      wait_count(ctx.ct_h, i);
 
       rtt[i - 1] = (MPI_Wtime() - t0) * 1e6;
     }
   }
 
-  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   if(0 == rank)
-    MPI_Recv(setup, opts.iterations + opts.warmup, MPI_DOUBLE, 1, 0,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_CHECK(MPI_Recv(setup, opts.iterations + opts.warmup, MPI_DOUBLE, 1, 0,
+                       MPI_COMM_WORLD, MPI_STATUS_IGNORE));
   else
-    MPI_Send(setup, opts.iterations + opts.warmup, MPI_DOUBLE, 0, 0,
-             MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Send(setup, opts.iterations + opts.warmup, MPI_DOUBLE, 0, 0,
+                       MPI_COMM_WORLD));
 
   if(0 == rank)
   {
     for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
     {
-      fprintf(stdout, "%i,PtlTriggeredPut,%lu,%.4f,%.4f\n", i - opts.warmup,
-              opts.msg_size, rtt[i], setup[i]);
+      fprintf(stdout,
+              table_output ? "%6i  PtlTriggeredPut  %10zu %14.4f %14.4f\n"
+                           : "%i,PtlTriggeredPut,%zu,%.4f,%.4f\n",
+              i - opts.warmup, opts.msg_size, rtt[i], setup[i]);
     }
   }
 
-  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  wait_count(send_ct, opts.iterations + opts.warmup);
+  validate_buffer(buffer, opts.msg_size, 'c');
   p4_le_remove(le_h);
   p4_md_free(md_h);
+  P4_CHECK(PtlCTFree(send_ct));
+  free(send_buffer);
   free(buffer);
   free(rtt);
   free(setup);
@@ -119,30 +129,46 @@ run_ping_pong_benchmark()
 {
   ptl_handle_le_t le_h;
   ptl_handle_md_t md_h;
-  ptl_index_t index;
-  ptl_ct_event_t event;
+  ptl_pt_index_t index;
+  ptl_handle_ct_t send_ct;
+  void* send_buffer = NULL;
   int eret = -1;
   void* buffer = NULL;
 
   double t0;
-  double* time = malloc(opts.iterations * opts.warmup * sizeof(double));
+  double* time =
+      malloc((size_t)(opts.iterations + opts.warmup) * sizeof(double));
+  if(!time)
+    bench_fail("Sample allocation failed");
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
   {
-    MPI_Abort(MPI_COMM_WORLD, -1);
+    P4_CHECK(eret);
   }
 
   if(0 == rank)
   {
-    fprintf(stdout, "n,func,msg_size,rtt\n");
+    fprintf(stdout,
+            table_output
+                ? "Sample  Operation              Bytes       RTT (us)\n"
+                : "n,func,msg_size,rtt\n");
   }
 
   alloc_buffer_init(&buffer, opts.msg_size);
-  p4_le_insert_ct_comm(&ctx, &le_h, buffer, opts.msg_size, index);
-  p4_md_alloc_ct(&ctx, &md_h, buffer, opts.msg_size);
+  memset(buffer, 'r', opts.msg_size);
+  alloc_buffer_init(&send_buffer, opts.msg_size);
+  P4_CHECK(p4_le_insert_ct_comm(&ctx, &le_h, buffer, opts.msg_size, index));
+  P4_CHECK(PtlCTAlloc(ctx.ni_h, &send_ct));
+  // Count local sends separately: they must never advance receive triggers.
+  ptl_md_t md = {.start = send_buffer,
+                 .length = opts.msg_size,
+                 .options = PTL_MD_EVENT_CT_SEND | PTL_MD_EVENT_SUCCESS_DISABLE,
+                 .ct_handle = send_ct,
+                 .eq_handle = PTL_EQ_NONE};
+  P4_CHECK(PtlMDBind(ctx.ni_h, &md, &md_h));
 
-  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   for(int i = 1; i <= opts.iterations + opts.warmup; ++i)
   {
@@ -155,31 +181,15 @@ run_ping_pong_benchmark()
       if(PTL_OK != eret)
       {
         fprintf(stderr, "PtlPut failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
+        P4_CHECK(eret);
       }
-      eret = PtlCTWait(ctx.ct_h, i, &event);
-      if(PTL_OK != eret)
-      {
-        fprintf(stderr, "PtlCTWait failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
-      }
-
-      assert(0 == event.failure);
-      assert(i == event.success);
+      wait_count(ctx.ct_h, i);
 
       time[i - 1] = (MPI_Wtime() - t0) * 1e6;
     }
     else
     {
-      eret = PtlCTWait(ctx.ct_h, i, &event);
-      if(PTL_OK != eret)
-      {
-        fprintf(stderr, "PtlCTWait failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
-      }
-
-      assert(0 == event.failure);
-      assert(i == event.success);
+      wait_count(ctx.ct_h, i);
 
       eret = PtlPut(md_h, 0, opts.msg_size, PTL_NO_ACK_REQ, ctx.peer_addr,
                     index, 0, 0, NULL, 0);
@@ -187,7 +197,7 @@ run_ping_pong_benchmark()
       if(PTL_OK != eret)
       {
         fprintf(stderr, "PtlPut failed with %i\n", eret);
-        MPI_Abort(MPI_COMM_WORLD, -1);
+        P4_CHECK(eret);
       }
     }
   }
@@ -196,13 +206,19 @@ run_ping_pong_benchmark()
   {
     for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
     {
-      fprintf(stdout, "%i,PtlPut,%lu,%.4f\n", i - opts.warmup, opts.msg_size,
-              time[i]);
+      fprintf(stdout,
+              table_output ? "%6i  PtlPut           %10zu %14.4f\n"
+                           : "%i,PtlPut,%zu,%.4f\n",
+              i - opts.warmup, opts.msg_size, time[i]);
     }
   }
-  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  wait_count(send_ct, opts.iterations + opts.warmup);
+  validate_buffer(buffer, opts.msg_size, 'c');
   p4_le_remove(le_h);
   p4_md_free(md_h);
+  P4_CHECK(PtlCTFree(send_ct));
+  free(send_buffer);
   free(buffer);
   free(time);
   p4_pt_free(&ctx, index);
@@ -211,8 +227,10 @@ run_ping_pong_benchmark()
 void
 print_help_message()
 {
-  printf("Usage: program_name [OPTIONS]\n");
+  printf("Usage: ptl_ping_pong [OPTIONS]\n");
   printf("Options:\n");
+  printf("  -t, --triggered           Pre-post triggered replies\n");
+  printf("  --table                   Human-readable output (default CSV)\n");
   printf("  -i, --iterations <arg>    Specify the number of iterations to run "
          "(required argument).\n");
   printf("  -w, --warmup <arg>        Specify the number of warmup iterations "
@@ -226,13 +244,14 @@ int
 main(int argc, char* argv[])
 {
   int eret = -1;
-  ptl_ct_event_t zct = {.failure = 0, .success = 0};
   static const struct option long_opts[] = {
       {"iterations", required_argument, NULL, 'i'},
       {"warmup", required_argument, NULL, 'w'},
       {"msg_size", required_argument, NULL, 'm'},
       {"triggered", no_argument, NULL, 't'},
-      {"help", no_argument, NULL, 'h'}};
+      {"table", no_argument, NULL, 1000},
+      {"help", no_argument, NULL, 'h'},
+      {0, 0, 0, 0}};
 
   const char* const short_opts = "i:w:m:th";
 
@@ -252,20 +271,19 @@ main(int argc, char* argv[])
     switch(opt)
     {
     case 'i':
-      opts.iterations = atoi(optarg);
-      break;
-    case 'c':
-      opts.cache_size = atoi(optarg);
-      opts.cache_size *= MiB;
+      opts.iterations = parse_int(optarg);
       break;
     case 'm':
-      opts.msg_size = atoi(optarg);
+      opts.msg_size = parse_size(optarg);
       break;
     case 'w':
-      opts.warmup = atoi(optarg);
+      opts.warmup = parse_int(optarg);
       break;
     case 't':
       triggered = 1;
+      break;
+    case 1000:
+      table_output = 1;
       break;
     case 'h':
       print_help_message();
@@ -280,43 +298,51 @@ main(int argc, char* argv[])
   }
 
   int name_len;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
-  MPI_Get_processor_name(processor_name, &name_len);
+  if(optind != argc)
+    option_error("Unexpected positional argument");
+  validate_iterations(opts.iterations, opts.warmup);
+  validate_range(opts.msg_size, opts.msg_size, 1);
+  MPI_CHECK(MPI_Init(&argc, &argv));
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &num_ranks));
+  MPI_CHECK(MPI_Get_processor_name(processor_name, &name_len));
 
   if(2 != num_ranks)
   {
-    fprintf(stderr, "Benchmark requires exactly two processes\n");
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    bench_fail("Benchmark requires exactly two processes");
   }
 
-  PtlInit();
-  eret = init_p4_ctx(&ctx, PTL_NI_NO_MATCHING);
+  P4_CHECK(PtlInit());
+  eret = init_p4_ctx(&ctx, NON_MATCHING);
   if(PTL_OK != eret)
-    goto END;
+    bench_fail("Benchmark initialization failed");
 
   eret = exchange_ni_address(&ctx, rank);
 
-  if(0 > eret)
-    goto END;
+  if(0 != eret)
+    bench_fail("Benchmark initialization failed");
 
-  cache_buffer = malloc(opts.cache_size);
-  if(NULL == cache_buffer)
-    goto END;
-  cache_buffer_size = opts.cache_size / sizeof(int);
-
-  set_cache_regions(1);
+  check_message_size(&ctx, opts.msg_size);
+  if(triggered && opts.iterations + opts.warmup > ctx.limits.max_triggered_ops)
+  {
+    fprintf(stderr, "rank %d: NI max_triggered_ops=%d, requested=%d\n", rank,
+            ctx.limits.max_triggered_ops, opts.iterations + opts.warmup);
+    bench_fail("Iterations plus warmup exceed NI max_triggered_ops");
+  }
+  if(rank == 0)
+    fprintf(stderr,
+            "op=put ni=non-matching events=counting triggered=%d "
+            "bytes=%zu window=1 iterations=%d warmup=%d; RTT and "
+            "trigger setup in us; initialized separate send/receive buffers\n",
+            triggered, opts.msg_size, opts.iterations, opts.warmup);
 
   if(triggered)
     run_triggered_ping_pong_benchmark();
   else
     run_ping_pong_benchmark();
 
-END:
-  free(cache_buffer);
   destroy_p4_ctx(&ctx);
   PtlFini();
-  MPI_Finalize();
+  MPI_CHECK(MPI_Finalize());
   return eret;
 }

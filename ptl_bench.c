@@ -2,6 +2,7 @@
 #include "util.h"
 #include <getopt.h>
 
+static int table_output;
 static int rank;
 static int num_ranks;
 static benchmark_opts_t opts;
@@ -13,31 +14,14 @@ size_t cache_buffer_size;
 static inline void
 wait_for_completion(const ptl_size_t wait_for)
 {
-  int eret;
   if(COUNTING == opts.event_type)
-  {
-    ptl_ct_event_t ct_event;
-    eret = PtlCTWait(ctx.ct_h, wait_for, &ct_event);
-    if(PTL_OK != eret || ct_event.failure > 0)
-    {
-      fprintf(stderr, "PtlCTWait failed\n");
-      MPI_Abort(MPI_COMM_WORLD, eret);
-    }
-  }
+    wait_count(ctx.ct_h, wait_for);
   else
   {
     ptl_event_t event;
-    for(int i = 0; i < wait_for; ++i)
-    {
-      // rintf("Waiting for event %i of %i\n", i, wait_for);
-      // fflush(stdout);
-      eret = PtlEQWait(ctx.eq_h, &event);
-      if(PTL_OK != eret || event.ni_fail_type != PTL_NI_OK)
-      {
-        fprintf(stderr, "PtlCTWait failed\n");
-        MPI_Abort(MPI_COMM_WORLD, eret);
-      }
-    }
+    for(ptl_size_t i = 0; i < wait_for; ++i)
+      wait_event(ctx.eq_h, opts.op == PUT ? PTL_EVENT_ACK : PTL_EVENT_REPLY,
+                 &event);
   }
 }
 
@@ -48,31 +32,31 @@ p4_put_latency()
   ptl_handle_md_t md_h;
   ptl_handle_le_t le_h;
   ptl_handle_me_t me_h;
-  ptl_index_t index;
-  ptl_ct_event_t ct_event;
+  ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
-  ptl_event_t event;
   void* buffer = NULL;
-  double t0, t;
+  double t0 = 0.0, t;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
 
   // print header
   if(0 == rank)
-    fprintf(stdout, "func,msg_size,latency\n");
+    fprintf(stdout, table_output ? "Operation    Bytes    Completion (us)\n"
+                                 : "func,msg_size,latency\n");
 
   for(size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
       msg_size *= 2)
   {
     eret = alloc_buffer_init(&buffer, msg_size);
-    if(0 > eret)
-      return eret;
+    if(0 != eret)
+      P4_CHECK(eret);
 
     if(1 == rank)
     {
+      memset(buffer, 'd', msg_size);
       if(MATCHING == opts.ni_mode)
       {
         eret = p4_me_insert_persistent(&ctx, &me_h, buffer, msg_size, index);
@@ -82,13 +66,11 @@ p4_put_latency()
         eret = p4_le_insert(&ctx, &le_h, buffer, msg_size, index);
       }
       if(PTL_OK != eret)
-      {
-        fprintf(stderr, "List entry insertion failed\n");
-        return eret;
-      }
+        P4_CHECK(eret);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    P4_CHECK(eret);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     if(0 == rank)
     {
@@ -97,11 +79,7 @@ p4_put_latency()
       else
         eret = p4_md_alloc_eq(&ctx, &md_h, buffer, msg_size);
       if(PTL_OK != eret)
-      {
-        free(buffer);
-        fprintf(stderr, "md alloc failed with %i\n", eret);
-        return eret;
-      }
+        P4_CHECK(eret);
 
       for(int i = 0; i < opts.iterations + opts.warmup; ++i)
       {
@@ -118,19 +96,17 @@ p4_put_latency()
                       match_bits, 0, NULL, 0);
 
         if(PTL_OK != eret)
-        {
-          fprintf(stderr, "PtlPut failed with %i\n", eret);
-          p4_md_free(md_h);
-          free(buffer);
-          return eret;
-        }
+          P4_CHECK(eret);
 
-        wait_for_completion(1);
+        wait_for_completion(opts.event_type == COUNTING ? (ptl_size_t)i + 1
+                                                        : 1);
 
         if(i >= opts.warmup)
         {
           t = MPI_Wtime() - t0;
-          fprintf(stdout, "put,%lu,%.4f\n", msg_size, t * 1e6);
+          fprintf(stdout,
+                  table_output ? "put     %10zu    %16.4f\n" : "put,%zu,%.4f\n",
+                  msg_size, t * 1e6);
           fflush(stdout);
         }
       }
@@ -138,14 +114,11 @@ p4_put_latency()
       {
         eret = PtlCTSet(ctx.ct_h, zero);
         if(PTL_OK != eret)
-        {
-          fprintf(stderr, "PtlCTSet failed %i\n", eret);
-          return eret;
-        }
+          P4_CHECK(eret);
       }
       p4_md_free(md_h);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     if(1 == rank)
     {
       if(MATCHING == opts.ni_mode)
@@ -153,8 +126,11 @@ p4_put_latency()
       else
         p4_le_remove(le_h);
     }
+    if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
+      validate_buffer(buffer, msg_size, opts.op == PUT ? 'c' : 'd');
     free(buffer);
   }
+  p4_pt_free(&ctx, index);
   return 0;
 }
 
@@ -165,41 +141,42 @@ p4_get_latency()
   ptl_handle_md_t md_h;
   ptl_handle_le_t le_h;
   ptl_handle_me_t me_h;
-  ptl_index_t index;
-  ptl_ct_event_t ct_event;
+  ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
-  ptl_event_t event;
   void* buffer = NULL;
-  double t0, t;
+  double t0 = 0.0, t;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
   if(0 == rank)
-    fprintf(stdout, "func,msg_size,latency\n");
+    fprintf(stdout, table_output ? "Operation    Bytes    Completion (us)\n"
+                                 : "func,msg_size,latency\n");
 
   for(size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
       msg_size *= 2)
   {
     eret = alloc_buffer_init(&buffer, msg_size);
-    if(0 > eret)
-      return eret;
+    if(0 != eret)
+      P4_CHECK(eret);
 
     if(1 == rank)
     {
+      memset(buffer, 'd', msg_size);
       if(MATCHING == opts.ni_mode)
       {
-        p4_me_insert_persistent(&ctx, &me_h, buffer, msg_size, index);
+        eret = p4_me_insert_persistent(&ctx, &me_h, buffer, msg_size, index);
       }
       else
       {
-        p4_le_insert(&ctx, &le_h, buffer, msg_size, index);
+        eret = p4_le_insert(&ctx, &le_h, buffer, msg_size, index);
       }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    P4_CHECK(eret);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     if(0 == rank)
     {
@@ -208,10 +185,7 @@ p4_get_latency()
       else
         eret = p4_md_alloc_eq(&ctx, &md_h, buffer, msg_size);
       if(PTL_OK != eret)
-      {
-        free(buffer);
-        return eret;
-      }
+        P4_CHECK(eret);
 
       for(int i = 0; i < opts.iterations + opts.warmup; ++i)
       {
@@ -226,18 +200,17 @@ p4_get_latency()
         eret = PtlGet(md_h, 0, msg_size, ctx.peer_addr, index, match_bits, 0,
                       NULL);
         if(PTL_OK != eret)
-        {
-          p4_md_free(md_h);
-          free(buffer);
-          return eret;
-        }
+          P4_CHECK(eret);
 
-        wait_for_completion(1);
+        wait_for_completion(opts.event_type == COUNTING ? (ptl_size_t)i + 1
+                                                        : 1);
 
         if(i >= opts.warmup)
         {
           t = MPI_Wtime() - t0;
-          fprintf(stdout, "get,%lu,%.4f\n", msg_size, t * 1e6);
+          fprintf(stdout,
+                  table_output ? "get     %10zu    %16.4f\n" : "get,%zu,%.4f\n",
+                  msg_size, t * 1e6);
           fflush(stdout);
         }
       }
@@ -245,14 +218,11 @@ p4_get_latency()
       {
         eret = PtlCTSet(ctx.ct_h, zero);
         if(PTL_OK != eret)
-        {
-          fprintf(stderr, "PtlCTSet failed with %i\n");
-          return eret;
-        }
+          P4_CHECK(eret);
       }
       p4_md_free(md_h);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     if(1 == rank)
     {
       if(MATCHING == opts.ni_mode)
@@ -260,8 +230,11 @@ p4_get_latency()
       else
         p4_le_remove(le_h);
     }
+    if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
+      validate_buffer(buffer, msg_size, opts.op == PUT ? 'c' : 'd');
     free(buffer);
   }
+  p4_pt_free(&ctx, index);
   return 0;
 }
 
@@ -273,35 +246,31 @@ p4_put_bandwidth()
   ptl_handle_le_t le_h;
   ptl_handle_me_t me_h;
   ptl_size_t offset;
-  ptl_index_t index;
-  ptl_ct_event_t ct_event;
+  ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
-  ptl_event_t event;
   void* buffer = NULL;
-  double t0, t;
+  double t0 = 0.0, t;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
-  {
-    fprintf(stderr, "pt alloc failed\n");
-    fflush(stderr);
-    return eret;
-  }
+    P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
   if(0 == rank)
-    fprintf(stdout, "func,msg_size,bandwidth\n");
+    fprintf(stdout, table_output ? "Operation    Bytes    Bandwidth (MB/s)\n"
+                                 : "func,msg_size,bandwidth\n");
 
   for(size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
       msg_size *= 2)
   {
     size_t bytes = opts.window_size * msg_size;
     eret = alloc_buffer_init(&buffer, bytes);
-    if(0 > eret)
-      return eret;
+    if(0 != eret)
+      P4_CHECK(eret);
 
     if(1 == rank)
     {
+      memset(buffer, 'd', bytes);
       if(MATCHING == opts.ni_mode)
       {
         eret = p4_me_insert_persistent(&ctx, &me_h, buffer, bytes, index);
@@ -310,15 +279,12 @@ p4_put_bandwidth()
       {
         eret = p4_le_insert(&ctx, &le_h, buffer, bytes, index);
       }
-      if(eret < 0)
-      {
-        fprintf(stderr, "entry alloc failed\n");
-        fflush(stderr);
-        return -1;
-      }
+      if(PTL_OK != eret)
+        P4_CHECK(eret);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    P4_CHECK(eret);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     if(0 == rank)
     {
@@ -327,12 +293,7 @@ p4_put_bandwidth()
       else
         eret = p4_md_alloc_eq(&ctx, &md_h, buffer, bytes);
       if(PTL_OK != eret)
-      {
-        fprintf(stderr, "md alloc failed\n");
-        free(buffer);
-        fflush(stderr);
-        return eret;
-      }
+        P4_CHECK(eret);
 
       for(int i = 0; i < opts.iterations + opts.warmup; ++i)
       {
@@ -350,13 +311,7 @@ p4_put_bandwidth()
           eret = PtlPut(md_h, offset, msg_size, PTL_ACK_REQ, ctx.peer_addr,
                         index, match_bits, offset, NULL, 0);
           if(PTL_OK != eret)
-          {
-            fprintf(stderr, "PtlPut failed with %i\n", eret);
-            p4_md_free(md_h);
-            free(buffer);
-            fflush(stderr);
-            return eret;
-          }
+            P4_CHECK(eret);
         }
 
         wait_for_completion(opts.window_size);
@@ -364,24 +319,21 @@ p4_put_bandwidth()
         if(i >= opts.warmup)
         {
           t = MPI_Wtime() - t0;
-          fprintf(stdout, "put,%lu,%.4f\n", msg_size,
-                  (msg_size * opts.window_size * 1e-6) / t);
+          fprintf(stdout,
+                  table_output ? "put     %10zu    %16.4f\n" : "put,%zu,%.4f\n",
+                  msg_size, (msg_size * opts.window_size * 1e-6) / t);
           fflush(stdout);
         }
         if(0 == rank && COUNTING == opts.event_type)
         {
           eret = PtlCTSet(ctx.ct_h, zero);
           if(PTL_OK != eret)
-          {
-            fprintf(stderr, "PtlCTSet failed with %i\n");
-            fflush(stderr);
-            return eret;
-          }
+            P4_CHECK(eret);
         }
       }
       p4_md_free(md_h);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     if(1 == rank)
     {
       if(MATCHING == opts.ni_mode)
@@ -389,8 +341,11 @@ p4_put_bandwidth()
       else
         p4_le_remove(le_h);
     }
+    if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
+      validate_buffer(buffer, bytes, opts.op == PUT ? 'c' : 'd');
     free(buffer);
   }
+  p4_pt_free(&ctx, index);
   return 0;
 }
 
@@ -402,42 +357,43 @@ p4_get_bandwidth()
   ptl_handle_le_t le_h;
   ptl_handle_me_t me_h;
   ptl_size_t offset;
-  ptl_index_t index;
-  ptl_ct_event_t ct_event;
+  ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
-  ptl_event_t event;
   void* buffer = NULL;
-  double t0, t;
+  double t0 = 0.0, t;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
   if(0 == rank)
-    fprintf(stdout, "func,msg_size,bandwidth\n");
+    fprintf(stdout, table_output ? "Operation    Bytes    Bandwidth (MB/s)\n"
+                                 : "func,msg_size,bandwidth\n");
 
   for(size_t msg_size = opts.min_msg_size; msg_size <= opts.max_msg_size;
       msg_size *= 2)
   {
     size_t bytes = opts.window_size * msg_size;
     eret = alloc_buffer_init(&buffer, bytes);
-    if(0 > eret)
-      return eret;
+    if(0 != eret)
+      P4_CHECK(eret);
 
     if(1 == rank)
     {
+      memset(buffer, 'd', bytes);
       if(MATCHING == opts.ni_mode)
       {
-        p4_me_insert_persistent(&ctx, &me_h, buffer, bytes, index);
+        eret = p4_me_insert_persistent(&ctx, &me_h, buffer, bytes, index);
       }
       else
       {
-        p4_le_insert(&ctx, &le_h, buffer, bytes, index);
+        eret = p4_le_insert(&ctx, &le_h, buffer, bytes, index);
       }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    P4_CHECK(eret);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     if(0 == rank)
     {
@@ -446,11 +402,7 @@ p4_get_bandwidth()
       else
         eret = p4_md_alloc_eq(&ctx, &md_h, buffer, bytes);
       if(PTL_OK != eret)
-      {
-        fprintf(stderr, "md alloc faile\n");
-        free(buffer);
-        return eret;
-      }
+        P4_CHECK(eret);
 
       for(int i = 0; i < opts.iterations + opts.warmup; ++i)
       {
@@ -468,12 +420,7 @@ p4_get_bandwidth()
           eret = PtlGet(md_h, offset, msg_size, ctx.peer_addr, index,
                         match_bits, offset, NULL);
           if(PTL_OK != eret)
-          {
-            fprintf(stderr, "PtlGet failed");
-            p4_md_free(md_h);
-            free(buffer);
-            return eret;
-          }
+            P4_CHECK(eret);
         }
 
         wait_for_completion(opts.window_size);
@@ -481,8 +428,9 @@ p4_get_bandwidth()
         if(i >= opts.warmup)
         {
           t = MPI_Wtime() - t0;
-          fprintf(stdout, "get,%lu,%.4f\n", msg_size,
-                  (msg_size * opts.window_size * 1e-6) / t);
+          fprintf(stdout,
+                  table_output ? "get     %10zu    %16.4f\n" : "get,%zu,%.4f\n",
+                  msg_size, (msg_size * opts.window_size * 1e-6) / t);
           fflush(stdout);
         }
 
@@ -490,15 +438,12 @@ p4_get_bandwidth()
         {
           eret = PtlCTSet(ctx.ct_h, zero);
           if(PTL_OK != eret)
-          {
-            fprintf(stderr, "PtlCTSet failed with %i\n");
-            return eret;
-          }
+            P4_CHECK(eret);
         }
       }
       p4_md_free(md_h);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     if(1 == rank)
     {
       if(MATCHING == opts.ni_mode)
@@ -506,15 +451,18 @@ p4_get_bandwidth()
       else
         p4_le_remove(le_h);
     }
+    if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
+      validate_buffer(buffer, bytes, opts.op == PUT ? 'c' : 'd');
     free(buffer);
   }
+  p4_pt_free(&ctx, index);
   return 0;
 }
 
 void
 print_help_message()
 {
-  fprintf(stdout, "Usage: [options]\n");
+  fprintf(stdout, "Usage: ptl_bench [options]\n");
   fprintf(stdout, "Options:\n");
   fprintf(stdout, "  -m, --matching                 Enable matching mode (no "
                   "argument required)\n");
@@ -538,18 +486,23 @@ print_help_message()
           "(required argument)\n");
   fprintf(stdout, "  -w, --window_size <value>      Specify the window size "
                   "(required argument)\n");
-  fprintf(stdout,
-          "  -c, --cache_size <value>       Specify the cache size (required "
-          "argument)\n");
-  fprintf(stdout,
-          "  --cold_cache 	              Enable cold cache mode with "
-          "specified cache size (required argument)\n");
+  fprintf(
+      stdout,
+      "  -c, --cache_size <value>       Specify cache size in MiB (required "
+      "argument)\n");
+  fprintf(
+      stdout,
+      "  --cold_cache 	              Enable cache sweep (no argument)\n");
   fprintf(stdout,
           "  -f, --full                     Enable full mode (no argument "
           "required)\n");
   fprintf(stdout,
           "  -h, --help                     Display this help message (no "
           "argument required)\n");
+  printf(
+      "  --table                       Human-readable output (default: CSV)\n");
+  printf("  -p, --pids <value>             Set BXI cache regions "
+         "(site-specific)\n");
   fflush(stdout);
 }
 
@@ -565,13 +518,14 @@ print_benchmark_opts()
           opts.event_type == COUNTING ? "COUNTING" : "FULL");
   fprintf(stderr, "iterations: %i\n", opts.iterations);
   fprintf(stderr, "warmup: %i\n", opts.warmup);
-  fprintf(stderr, "window_size: %i\n", opts.window_size);
-  fprintf(stderr, "msg_size: %i\n", opts.msg_size);
-  fprintf(stderr, "min_msg_size: %i\n", opts.min_msg_size);
-  fprintf(stderr, "max_msg_size: %i\n", opts.max_msg_size);
-  fprintf(stderr, "cache_size: %lu\n", opts.cache_size);
+  fprintf(stderr, "window_size: %i\n",
+          opts.type == LATENCY ? 1 : opts.window_size);
+  fprintf(stderr, "min_msg_size: %zu\n", opts.min_msg_size);
+  fprintf(stderr, "max_msg_size: %zu\n", opts.max_msg_size);
+  fprintf(stderr, "cache_size: %zu\n", opts.cache_size);
   fprintf(stderr, "cache_state: %s\n\n",
           opts.cache_state == COLD_CACHE ? "COLD_CACHE" : "HOT_CACHE");
+  fprintf(stderr, "units: bytes, completion latency in us, decimal MB/s\n");
   fflush(stderr);
 }
 
@@ -579,6 +533,7 @@ int
 main(int argc, char* argv[])
 {
   int eret = -1;
+  int cache_regions = -1;
 
   static const struct option long_opts[] = {
       {"matching", no_argument, NULL, 'm'},
@@ -594,7 +549,9 @@ main(int argc, char* argv[])
       {"cold_cache", no_argument, NULL, 4},
       {"full", no_argument, NULL, 'f'},
       {"pids", required_argument, NULL, 'p'},
-      {"help", no_argument, NULL, 'h'}};
+      {"table", no_argument, NULL, 1000},
+      {"help", no_argument, NULL, 'h'},
+      {0, 0, 0, 0}};
 
   const char* const short_opts = "mbgi:x:w:c:fp:h";
 
@@ -630,37 +587,39 @@ main(int argc, char* argv[])
       opts.op = GET;
       break;
     case 'i':
-      opts.iterations = atoi(optarg);
+      opts.iterations = parse_int(optarg);
       break;
     case 'x':
-      opts.warmup = atoi(optarg);
+      opts.warmup = parse_int(optarg);
       break;
     case 'c':
-      opts.cache_size = atoi(optarg);
-      opts.cache_size *= MiB;
+      opts.cache_size = parse_mib(optarg);
       break;
     case 'p':
-      set_cache_regions(atoi(optarg));
+      cache_regions = parse_int(optarg);
       break;
     case 1:
-      opts.msg_size = atoi(optarg);
+      opts.msg_size = parse_size(optarg);
       opts.min_msg_size = opts.msg_size;
       opts.max_msg_size = opts.msg_size;
       break;
     case 2:
-      opts.min_msg_size = atol(optarg);
+      opts.min_msg_size = parse_size(optarg);
       break;
     case 3:
-      opts.max_msg_size = atol(optarg);
+      opts.max_msg_size = parse_size(optarg);
       break;
     case 4:
       opts.cache_state = COLD_CACHE;
       break;
     case 'w':
-      opts.window_size = atol(optarg);
+      opts.window_size = parse_int(optarg);
       break;
     case 'f':
       opts.event_type = FULL;
+      break;
+    case 1000:
+      table_output = 1;
       break;
     case 'h':
       print_help_message();
@@ -674,50 +633,61 @@ main(int argc, char* argv[])
     }
   } // end while
 
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+  if(optind != argc)
+    option_error("Unexpected positional argument");
+  validate_iterations(opts.iterations, opts.warmup);
+  validate_range(opts.min_msg_size, opts.max_msg_size, opts.window_size);
+  if(opts.event_type == FULL && opts.window_size > 4096)
+    option_error("Full-event window exceeds the 4096-entry EQ capacity");
+  MPI_CHECK(MPI_Init(&argc, &argv));
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &num_ranks));
 
   if(2 != num_ranks)
   {
-    fprintf(stdout, "Benchmark requires exactly two processes\n");
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    fprintf(stderr, "Benchmark requires exactly two processes\n");
+    bench_fail("Benchmark failed; see preceding diagnostic");
   }
+
+  if(cache_regions >= 0 && set_cache_regions(cache_regions) != 0)
+    bench_fail("Cannot configure BXI cache regions");
 
   if(0 == rank)
     print_benchmark_opts();
 
-  PtlInit();
+  P4_CHECK(PtlInit());
 
   eret = init_p4_ctx(&ctx, opts.ni_mode);
   if(PTL_OK != eret)
   {
     fprintf(stderr, "init failed with %i\n", eret);
-    goto END;
+    bench_fail("Benchmark initialization failed");
   }
+
+  check_message_size(&ctx, opts.max_msg_size);
 
   cache_buffer = malloc(opts.cache_size);
   if(NULL == cache_buffer)
-    goto END;
+    bench_fail("Benchmark initialization failed");
 
   cache_buffer_size = opts.cache_size / sizeof(int);
 
   eret = exchange_ni_address(&ctx, rank);
-  if(0 > eret)
+  if(0 != eret)
   {
     fprintf(stderr, " exchange failed\n");
-    goto END;
+    bench_fail("Benchmark initialization failed");
   }
 
   if(LATENCY == opts.type)
   {
     if(opts.op == PUT)
     {
-      p4_put_latency();
+      eret = p4_put_latency();
     }
     else
     {
-      p4_get_latency();
+      eret = p4_get_latency();
     }
   }
   else if(BANDWIDTH == opts.type)
@@ -728,13 +698,14 @@ main(int argc, char* argv[])
     }
     else
     {
-      p4_get_bandwidth();
+      eret = p4_get_bandwidth();
     }
   }
 
-END:
+  P4_CHECK(eret);
+  free(cache_buffer);
   destroy_p4_ctx(&ctx);
   PtlFini();
-  MPI_Finalize();
+  MPI_CHECK(MPI_Finalize());
   return eret;
 }

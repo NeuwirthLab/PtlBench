@@ -4,13 +4,84 @@
 
 #define REQUESTED_INDEX 99
 
+_Noreturn void
+bench_fail(const char* message)
+{
+  int initialized = 0, rank = -1;
+  MPI_Initialized(&initialized);
+  if(initialized)
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  fprintf(stderr, "rank %d: %s\n", rank, message);
+  if(initialized)
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  exit(EXIT_FAILURE);
+}
+
+void
+p4_check(int rc, const char* call)
+{
+  if(rc != PTL_OK)
+  {
+    char message[512];
+    snprintf(message, sizeof(message), "%s failed (Portals status %d)", call,
+             rc);
+    bench_fail(message);
+  }
+}
+
+void
+mpi_check(int rc, const char* call)
+{
+  if(rc != MPI_SUCCESS)
+    bench_fail(call);
+}
+
+void
+wait_event(ptl_handle_eq_t eq, ptl_event_kind_t kind, ptl_event_t* event)
+{
+  P4_CHECK(PtlEQWait(eq, event));
+  if(event->ni_fail_type != PTL_NI_OK || event->type != kind)
+  {
+    char message[160];
+    snprintf(message, sizeof(message),
+             "Portals event type=%u expected=%u failure=%u",
+             (unsigned)event->type, (unsigned)kind,
+             (unsigned)event->ni_fail_type);
+    bench_fail(message);
+  }
+}
+
+void
+wait_count(ptl_handle_ct_t ct, ptl_size_t threshold)
+{
+  ptl_ct_event_t event;
+  P4_CHECK(PtlCTWait(ct, threshold, &event));
+  if(event.failure || event.success < threshold)
+    bench_fail("Counting event reports failed or incomplete operations");
+}
+
+void
+validate_buffer(const void* buffer, size_t bytes, unsigned char expected)
+{
+  const unsigned char* data = buffer;
+  for(size_t i = 0; i < bytes; ++i)
+    if(data[i] != expected)
+      bench_fail("Payload validation failed");
+}
+
+void
+check_message_size(const p4_ctx_t* ctx, size_t size)
+{
+  if(size > ctx->limits.max_msg_size)
+    bench_fail("Message size exceeds the returned NI max_msg_size");
+}
+
 int
 init_p4_ctx(p4_ctx_t* const ctx, const ni_mode_t mode)
 {
   int eret = -1;
   unsigned int ni_matching =
       mode == MATCHING ? PTL_NI_MATCHING : PTL_NI_NO_MATCHING;
-  ptl_ni_limits_t ni_limits;
 
   ptl_ni_limits_t ni_requested_limits = {
       .max_entries = INT_MAX,
@@ -36,61 +107,65 @@ init_p4_ctx(p4_ctx_t* const ctx, const ni_mode_t mode)
   ctx->ni_h = PTL_INVALID_HANDLE;
 
   eret = PtlNIInit(PTL_IFACE_DEFAULT, ni_matching | PTL_NI_PHYSICAL,
-                   PTL_PID_ANY, &ni_requested_limits, &ni_limits, &ctx->ni_h);
+                   PTL_PID_ANY, &ni_requested_limits, &ctx->limits, &ctx->ni_h);
   if(PTL_OK != eret)
-    return eret;
+    goto fail;
 
   eret = PtlGetPhysId(ctx->ni_h, &ctx->my_addr);
   if(PTL_OK != eret)
-    return eret;
+    goto fail;
   eret = PtlEQAlloc(ctx->ni_h, 4096, &ctx->eq_h);
   if(PTL_OK != eret)
-    return eret;
+    goto fail;
   eret = PtlCTAlloc(ctx->ni_h, &ctx->ct_h);
   if(PTL_OK != eret)
-    return eret;
+    goto fail;
   return PTL_OK;
+fail:
+  destroy_p4_ctx(ctx);
+  p4_check(eret, "Portals context initialization");
+  return eret;
 }
 
 void
 destroy_p4_ctx(p4_ctx_t* const ctx)
 {
   if(!PtlHandleIsEqual(ctx->eq_h, PTL_INVALID_HANDLE))
-    PtlEQFree(ctx->eq_h);
+    P4_CHECK(PtlEQFree(ctx->eq_h));
   if(!PtlHandleIsEqual(ctx->ct_h, PTL_INVALID_HANDLE))
-    PtlCTFree(ctx->ct_h);
+    P4_CHECK(PtlCTFree(ctx->ct_h));
   if(!PtlHandleIsEqual(ctx->ni_h, PTL_INVALID_HANDLE))
-    PtlNIFini(ctx->ni_h);
+    P4_CHECK(PtlNIFini(ctx->ni_h));
 }
 
 int
 exchange_ni_address(p4_ctx_t* const ctx, const int my_rank)
 {
-  MPI_Request req[4];
+  // Exchange numeric fields independently of the vendor's underlying types.
+  uint64_t local[2] = {ctx->my_addr.phys.nid, ctx->my_addr.phys.pid};
+  uint64_t remote[2];
   int peer = (my_rank + 1) % 2;
 
-  MPI_Irecv(&ctx->peer_addr.phys.nid, 1, MPI_UNSIGNED, peer, 1, MPI_COMM_WORLD,
-            req);
-  MPI_Irecv(&ctx->peer_addr.phys.pid, 1, MPI_UNSIGNED, peer, 2, MPI_COMM_WORLD,
-            req + 1);
-  MPI_Isend(&ctx->my_addr.phys.nid, 1, MPI_UNSIGNED, peer, 1, MPI_COMM_WORLD,
-            req + 2);
-  MPI_Isend(&ctx->my_addr.phys.pid, 1, MPI_UNSIGNED, peer, 2, MPI_COMM_WORLD,
-            req + 3);
-  MPI_Waitall(4, req, MPI_STATUS_IGNORE);
+  MPI_CHECK(MPI_Sendrecv(local, 2, MPI_UINT64_T, peer, 1, remote, 2,
+                         MPI_UINT64_T, peer, 1, MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE));
+  ctx->peer_addr.phys.nid = remote[0];
+  ctx->peer_addr.phys.pid = remote[1];
   return 0;
 }
 
 int
-p4_pt_alloc(p4_ctx_t* const ctx, ptl_index_t* const index)
+p4_pt_alloc(p4_ctx_t* const ctx, ptl_pt_index_t* const index)
 {
+  if(ctx->limits.max_pt_index < REQUESTED_INDEX)
+    bench_fail("NI does not support portal index 99");
   return PtlPTAlloc(ctx->ni_h, 0, ctx->eq_h, REQUESTED_INDEX, index);
 }
 
 void
-p4_pt_free(p4_ctx_t* const ctx, ptl_index_t index)
+p4_pt_free(p4_ctx_t* const ctx, ptl_pt_index_t index)
 {
-  PtlPTFree(ctx->ni_h, index);
+  P4_CHECK(PtlPTFree(ctx->ni_h, index));
 }
 
 int
@@ -133,13 +208,13 @@ p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h)
 void
 p4_md_free(ptl_handle_md_t md_h)
 {
-  PtlMDRelease(md_h);
+  P4_CHECK(PtlMDRelease(md_h));
 }
 
 int
 p4_le_insert(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
              void* const start, const ptl_size_t length,
-             const ptl_index_t index)
+             const ptl_pt_index_t index)
 {
   int eret = -1;
   ptl_event_t event;
@@ -154,27 +229,17 @@ p4_le_insert(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
 
   eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
 int
 p4_le_insert_ct_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
                      void* const start, const ptl_size_t length,
-                     const ptl_index_t index)
+                     const ptl_pt_index_t index)
 {
   int eret = -1;
   ptl_event_t event;
@@ -189,27 +254,17 @@ p4_le_insert_ct_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
 
   eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
 int
 p4_le_insert_full_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
                        void* const start, const ptl_size_t length,
-                       const ptl_index_t index)
+                       const ptl_pt_index_t index)
 {
   int eret = -1;
   ptl_event_t event;
@@ -223,26 +278,16 @@ p4_le_insert_full_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
 
   eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
 int
 p4_le_insert_empty(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
-                   const ptl_index_t index)
+                   const ptl_pt_index_t index)
 {
   int eret = -1;
   ptl_event_t event;
@@ -257,33 +302,23 @@ p4_le_insert_empty(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
 
   eret = PtlLEAppend(ctx->ni_h, index, &le, PTL_PRIORITY_LIST, NULL, le_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
 void
 p4_le_remove(ptl_handle_le_t le_h)
 {
-  PtlLEUnlink(le_h);
+  P4_CHECK(PtlLEUnlink(le_h));
 }
 
 int
 p4_me_insert_persistent(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
                         void* const start, const ptl_size_t length,
-                        const ptl_index_t index)
+                        const ptl_pt_index_t index)
 {
   int eret = -1;
   ptl_event_t event;
@@ -306,28 +341,18 @@ p4_me_insert_persistent(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
 
   eret = PtlMEAppend(ctx->ni_h, index, &me, PTL_PRIORITY_LIST, NULL, me_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
-int
-__p4_me_insert(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h, void* start,
-               const ptl_size_t length, const ptl_index_t index,
-               const ptl_handle_ct_t ct_handle,
-               const ptl_match_bits_t match_bits)
+static int
+p4_me_insert_once(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h, void* start,
+                  const ptl_size_t length, const ptl_pt_index_t index,
+                  const ptl_handle_ct_t ct_handle,
+                  const ptl_match_bits_t match_bits)
 {
   int eret = -1;
   ptl_event_t event;
@@ -345,41 +370,31 @@ __p4_me_insert(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h, void* start,
                  .uid = PTL_UID_ANY,
                  .match_id = src,
                  .match_bits = match_bits,
-                 .ignore_bits = ~match_bits,
+                 .ignore_bits = 0,
                  .min_free = 0};
 
   eret = PtlMEAppend(ctx->ni_h, index, &me, PTL_PRIORITY_LIST, NULL, me_h);
   if(PTL_OK != eret)
-    return eret;
+    P4_CHECK(eret);
 
-  PtlEQWait(ctx->eq_h, &event);
+  wait_event(ctx->eq_h, PTL_EVENT_LINK, &event);
 
-  if(PTL_EVENT_LINK != event.type)
-  {
-    fprintf(stderr, "Failed to link LE\n");
-    return -1;
-  }
-  if(PTL_NI_OK != event.ni_fail_type)
-  {
-    fprintf(stderr, "ni_fail_type != PTL_NI_OK");
-    return -1;
-  }
   return eret;
 }
 
 int
 p4_me_insert_list_use_once(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
                            void* const* start, ptl_size_t* const length,
-                           const int num_entries, const ptl_index_t index,
+                           const int num_entries, const ptl_pt_index_t index,
                            const ptl_handle_ct_t ct_handle)
 {
   int eret = -1;
   ptl_match_bits_t match_bits = 1;
   for(int i = 0; i < num_entries; ++i)
   {
-    eret = __p4_me_insert(ctx, &me_h[i], start[i], length[i], index, ct_handle,
-                          match_bits++);
-    if(eret < 0)
+    eret = p4_me_insert_once(ctx, &me_h[i], start[i], length[i], index,
+                             ct_handle, match_bits++);
+    if(eret != PTL_OK)
       return -1;
   }
   return 0;
@@ -388,16 +403,16 @@ p4_me_insert_list_use_once(p4_ctx_t* const ctx, ptl_handle_me_t* const me_h,
 void
 p4_me_remove(ptl_handle_me_t me_h)
 {
-  PtlMEUnlink(me_h);
+  P4_CHECK(PtlMEUnlink(me_h));
 }
 
 int
 alloc_buffer_init(void** ptr, size_t bytes)
 {
-  size_t page_size = sysconf(_SC_PAGESIZE);
-  posix_memalign(ptr, page_size, bytes);
-  if(NULL == *ptr)
-    return -1;
+  long page_size = sysconf(_SC_PAGESIZE);
+  *ptr = NULL;
+  if(page_size <= 0 || posix_memalign(ptr, (size_t)page_size, bytes) != 0)
+    bench_fail("Aligned buffer allocation failed");
   memset(*ptr, 'c', bytes);
   return 0;
 }
@@ -405,28 +420,33 @@ alloc_buffer_init(void** ptr, size_t bytes)
 void
 invalidate_cache(int* const cache_buffer, const size_t elements)
 {
-  cache_buffer[0] = 1;
+  volatile int* buffer = cache_buffer;
+  if(elements == 0)
+    return;
+  buffer[0] = 1;
   for(size_t i = 1; i < elements; ++i)
   {
-    cache_buffer[i] = cache_buffer[i - 1];
+    buffer[i] = buffer[i - 1];
   }
 }
 
 int
 set_cache_regions(const int pids)
 {
-  int eret = -1;
   FILE* fptr;
 
   fptr = fopen("/sys/class/bxi/bxi0/v2p/cache_pids", "w");
 
   if(fptr == NULL)
   {
-    fprintf(stderr, "The file is not opened. The program will "
-                    "now exit.");
+    perror("BXI cache_pids");
     return -1;
   }
 
-  fprintf(fptr, "%i", pids);
+  if(fprintf(fptr, "%i", pids) < 0)
+  {
+    fclose(fptr);
+    return -1;
+  }
   return fclose(fptr);
 }

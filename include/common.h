@@ -45,10 +45,11 @@ typedef struct {
 } memory_benchmark_opts_t;
 
 typedef struct {
-	ptl_handle_ni_t ni_h;
-	ptl_handle_eq_t eq_h;
-	ptl_handle_ct_t ct_h;
-	ptl_process_t my_addr;
-	ptl_process_t peer_addr;
+  ptl_ni_limits_t limits;
+  ptl_handle_ni_t ni_h;
+  ptl_handle_eq_t eq_h;
+  ptl_handle_ct_t ct_h;
+  ptl_process_t my_addr;
+  ptl_process_t peer_addr;
 } p4_ctx_t;
 #endif

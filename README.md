@@ -1,107 +1,160 @@
-## PtlBench
-PtlBench is a Portals4 microbenchmark suite designed to test and analyze the performance of different parts of the Portals4 API. Unlike traditional low-level network benchmarks that use a client–server setup, PtlBench uses MPI for process orchestration,
-offering better portability, ease of use, and reliable synchronization through MPI’s collective operations. It works seamlessly with Portals4-enabled network interfaces and includes five focused microbenchmarks, each targeting a specific performance aspect of the Portals4 communication layer.
+# PtlBench
 
-### Benchmark Overview
-- **ptl_bench:** The ptl bench benchmark measures band-
-width and latency for PtlPut and PtlGet operations,
-modeled after OMB’s one-sided communication benchmarks.
-It supports both non-matching or matching NIs, and allows
-evaluation of event handling via either FEs or CTs. To assess
-cache effects, a custom cache saturation function is used to
-simulate cold-cache conditions by populating memory with
-random values. This enables controlled comparisons between
-cold and hot cache scenarios. On the target side, communi-
-cation uses either a persistent LE or ME, where “persistent”
-denotes reuse of the same list entry throughout the benchmark.
+PtlBench is a C11 microbenchmark suite for Portals4. MPI orchestrates and
+synchronizes the four communication benchmarks; each requires exactly two ranks.
+The standalone `pf_bench` measures the first CPU store to anonymous pages.
 
-- **ptl_me_none_persistent:** The ptl me none persistent
-benchmark measures the latency and bandwidth of Portals4’s
-matching network interface, focusing on communication pat-
-terns representative of MPI’s send-receive semantics. In con-
-trast to ptl_bench, which relies on persistent list entries
-regardless of matching behavior, this benchmark emulates
-more dynamic, per-message matching scenarios.
-It uses two portal indices: one for the command channel
-and another for data transfer. On the target side, multiple list
-entries are created, each associated with a distinct memory
-buffer as specified by the window_size parameter. The
-initiator begins transmission after receiving a notification via
-the command channel. Messages are matched to list entries
-using configured match bits, and upon successful transmis-
-sion, indicated by full events such as PTL_EVENT_PUT
-or PTL_EVENT_GET, the corresponding list entries are re-
-moved. This process repeats for each iteration.
+## Benchmarks
 
-- **ptl_memory_bench:** This benchmark evaluates the BXI
-NIC’s virtual-to-physical address translation performance by
-measuring page fault latency in both local and remote access
-scenarios. It supports both one-sided and ping-pong commu-
-nication patterns, using PtlPut and PtlGet operations.
-Memory is allocated using mmap to create page-sized virtual
-segments, relying on deferred physical allocation. This enables
-configuration of whether page faults are handled by the NIC or
-the host. Placement follows a first-touch policy, where initial
-access triggers physical allocation. Pages are classified as Hot
-(pre-allocated) or Cold (unallocated). Messages are constraint
-to 4 kB or less, with transfers targeting random offsets within
-each page. The ping-pong pattern mirrors the one-sided setup,
-enabling comparative analysis of translation overhead.
+| Executable | Measurement | Modes |
+| --- | --- | --- |
+| `ptl_bench` | Operation completion latency (us), or window throughput (decimal MB/s) | PUT/GET, matching/non-matching NI, counting/full events, optional initiator cache sweep |
+| `ptl_me_none_persistent` | Window throughput (MB/s) and window time divided by message count (us/operation) | PUT/GET, matching NI, full events, use-once MEs and a separate command portal |
+| `ptl_ping_pong` | Full round-trip time (us); triggered mode also reports reply setup time (us) | Standard PUT or pre-posted triggered PUT replies, counting events |
+| `ptl_memory_bench` | One-sided completion latency or PUT ping-pong RTT (us) | PUT/GET one-sided, independently hot/cold local and remote pages |
+| `pf_bench` | First CPU store time (ns) | Fresh anonymous pages, cache sweep before each sample |
 
-- **ptl_ping_pong:** This benchmark measures Round-Trip
-Time (RTT) using a ping-pong communication scheme. It
-highlights Portals4’s Triggered Operations, in which standard
-calls like PtlPut and PtlGet are deferred until a CT
-reaches a defined threshold, allowing the NIC to execute
-the operation autonomously, bypassing CPU involvement. The
-benchmark compares RTT between standard PtlPut and its
-triggered variant PtlTriggeredPut, and also quantifies the
-additional setup latency introduced by the trigger mechanism.
+`ptl_get_ni_props` is not implemented or built in this checkout. Returned NI limits
+are retained and checked by the communication benchmarks. The public executable
+name `ptl_me_none_persistent` is retained for compatibility.
 
-- **ptl_get_ni_props:** As a hardware implementation of
-Portals4, BXI imposes inherent limitations on available
-resources. Portals4 allows customization of these limits by
-providing a pointer to a plt_ni_limits_t structure
-during NI creation. This structure can be initialized with
-INT_MAX, LONG_MAX, or zero before proceeding with NI
-initialization. The actual resource limits imposed by the
-Portals4 implementation are then retrieved from a separate
-structure after initialization.
+The per-message benchmark posts one use-once ME per message, with exact match
+bits, before sending a readiness command. Target PUT/GET events establish
+completion and automatic unlinking. Its timed region includes the wait for
+readiness; entry setup can overlap the initiator's preceding iteration/reporting.
+Its reported latency is amortized window time, not individual message latency.
 
-### How to build
-To build PtlBench, ensure that both an MPI implementation (such as OpenMPI) and the Portals4 library are installed and accessible on your system.
+## Build and install
 
-```
-$ mkdir build && cd build
-$ cmake -DCMAKE_INSTALL_PREFIX=<INSTALL DEST> ..
-$ make -j
-$ make install
+Requirements: CMake 3.20 or newer, a C11 compiler, MPI with C support, and Portals4
+headers and library. Use a matching MPI compiler, launcher, and runtime library.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+cmake --install build --prefix /path/to/install
 ```
 
-### How to run
-```
-$ mpirun -np 2 ./ptl_bench
+All five executables are installed. Dependency discovery currently runs even when
+only `pf_bench` is requested; see [review recommendations](REVIEW.md).
+
+For a dependency installed outside standard system paths:
+
+```sh
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/dependency/prefix
 ```
 
-### Available Parameters
-Each benchmark provides a specialized set of available parameters. use ```-h, --help``` to list them:
+The finder searches for `portals4.h` and the library base name `portals`, including
+`lib` and `lib64`. Explicit overrides remain available:
+
+```sh
+cmake -S . -B build \
+  -DPORTALS_INCLUDE_DIR=/path/to/include \
+  -DPORTALS_LIBRARY=/path/to/lib/libportals.so \
+  -DMPI_C_COMPILER=/path/to/mpi/bin/mpicc
 ```
-$./ptl_bench --help
-Usage: [options]
-Options:
-  -b, --bandwidth                Enable bandwidth mode (no argument required)
-  -g, --get                      Enable get operation (no argument required)
-  -i, --iterations <value>       Specify the number of iterations (required argument)
-  -x, --warmup <value>           Specify the number of warmup iterations (required argument)
-  --msg_size <value>             Specify the message size (required argument)
-  --min_msg_size <value>         Specify the minimum message size (required argument)
-  --max_msg_size <value>         Specify the maximum message size (required argument)
-  -w, --window_size <value>      Specify the window size (required argument)
-  -c, --cache_size <value>       Specify the cache size (required argument)
-  --cold_cache                   Enable cold cache mode with specified cache size (required argument)
-  -f, --full                     Enable full event mode (no argument required)
-  -h, --help                     Display this help message (no argument required)
+
+Choose headers and a library from the same implementation. Use a fresh build
+directory when changing MPI or dependency installations: cached paths can retain
+an earlier installation. Configuration/linking success does not ensure runtime
+library availability on remote nodes. Configure the loader on every node (for
+example through the site's module or `LD_LIBRARY_PATH`).
+
+## Run and output
+
+```sh
+mpirun -np 2 ./build/ptl_bench --msg_size 8 -i 3 -x 1
+mpirun -np 2 ./build/ptl_bench --msg_size 8 -i 3 -x 1 --table
+mpirun -np 2 ./build/ptl_me_none_persistent --msg_size 8 -i 3 -u 1 -w 2
+mpirun -np 2 ./build/ptl_ping_pong -m 8 -i 3 -w 1 --triggered --table
+mpirun -np 2 ./build/ptl_memory_bench -m 8 -i 3 --local-hot --table
+./build/pf_bench -i 3 -w 1 --table
 ```
+
+On the reviewed cluster, initialize Lmod if the shell has not done so and load
+`module load openmpi/5.0.9`. The previously suggested `openmpi/portals4` module is
+not present there. Avoid mixing that module with `openmpi/ib`. An explicit
+one-rank-per-node Open MPI launch on the project hosts is:
+
+```sh
+mpirun -np 2 --host hpca-013,hpca-014 --map-by ppr:1:node \
+  -x LD_LIBRARY_PATH ./build/ptl_bench --msg_size 8 -i 3 -x 1 --table
+```
+
+Every executable supports `--help` and opt-in `--table`. CSV remains the default;
+its existing headers, column order, and numeric units are preserved. Configuration
+and diagnostics go to stderr, results to stdout. Only rank 0 reports network
+results. The legacy CSV `latency` field means RTT in memory ping-pong mode; it is
+not divided by two. `ptl_ping_pong` reports full RTT and, with `--triggered`, the
+local cost of registering each reply trigger on rank 1, not trigger execution time.
+
+Option spellings remain program-specific: `ptl_bench` uses `-x/--warmup` and
+`-w/--window_size`, the per-message benchmark uses `-u/--warmup` and
+`-w/--window-size`, and `ptl_ping_pong` uses `-w/--warmup`. Message sizes are bytes.
+Both cache-size options (`ptl_bench -c/--cache_size` and
+`ptl_memory_bench -c/--cache-size`) are in **MiB**, preserving their implemented
+behavior. `--cold_cache` takes no argument. Memory ping-pong only supports PUT;
+combining it with `--get` is rejected. Shared-page memory ping-pong also requires
+message size no greater than the returned NI `max_volatile_size`; use `-m 8` for
+the validated small-message case on this cluster. Positive iterations/message sizes/windows,
+nonnegative warm-up, bounded arithmetic, and valid ranges are required.
+
+Defaults: `ptl_bench` uses non-matching PUT/counting events, 10 measured iterations,
+10 warm-up, a doubling sweep from 1 to 4194304 bytes, and bandwidth window 64.
+The per-message benchmark uses PUT, one measured window, zero warm-up, window 64,
+and the same size sweep. `ptl_ping_pong` uses 512 bytes, 5000 measured iterations,
+and 100 warm-up; the total must fit the NI trigger capacity in triggered mode.
+`ptl_memory_bench` uses 512 bytes, 10 iterations, no warm-up, cold pages on both
+ranks, and one-sided PUT. Cache sweeps default to 16 MiB. `pf_bench` defaults to
+10000 measured pages and 100 warm-up pages; `count` retains the original page
+index, starting at the warm-up count.
+
+## Memory state and result comparability
+
+Memory experiments map fresh pages without initializing cold buffers. Hot flags
+touch the selected rank's page after binding, as in the original implementation.
+Messages fit within the actual system page size, at a randomly selected aligned
+message block. `--seed N` (default 1) makes offsets repeatable within a given C
+library in `ptl_memory_bench` and `pf_bench`; the seed and page size are reported.
+`pf_bench` selects its offset before starting the timer and excludes warm-up rows.
+
+A sequential volatile cache-buffer sweep is an eviction workload, not proof that
+all CPU caches are cold. The network cache option affects the initiator only;
+it does not reset NIC translation caches. Registration, huge pages, NUMA policy,
+GET from untouched zero-backed pages, and the implementation's handling of
+inaccessible target memory can change the observed work. Timing alone cannot
+identify whether the CPU, driver, or NIC serviced a page fault. Final payloads are checked after the initialized-buffer benchmarks. No validation
+reads are added to cold pages.
+
+CSV/table printing stays outside timed regions and at existing reporting points.
+Per-sample reporting may still perturb subsequent samples. Do not compare these
+short validation runs with performance baselines. Record build mode, MPI/Portals
+versions, placement, and memory settings for benchmark comparisons.
+
+Corrections affect comparison with old results: counting latency now waits for
+every operation, ping-pong uses independent initialized send/receive buffers and
+a separate send-completion counter, and cache sweeps cannot be optimized away.
+The per-message benchmark now uses the correct NI and command ME. `pf_bench`
+excludes warm-up and RNG overhead. Previous results affected by these defects
+should be regenerated. The programs no longer silently write the BXI cache-region
+sysfs setting at startup; `ptl_bench --pids N` remains an explicit site-specific
+control and reports write failures.
+
+## Focused validation
+
+```sh
+python3 tests/check.py --build build
+python3 tests/check_finder.py
+# Requires configured MPI/Portals4 and permission to launch on both hosts:
+python3 tests/check.py --build build --mpi --hosts hpca-013,hpca-014
+```
+
+The first command checks parsing, help, and standalone CSV/table output. `--mpi`
+also checks communication modes, warm-up/sample counts, memory-state combinations,
+and network CSV/table output, with a 30-second timeout for each MPI launch.
+These are smoke/regression checks, not performance measurements or proof of all
+resource-exhaustion and hardware failure behavior. See [REVIEW.md](REVIEW.md) for
+findings, validation details, and remaining recommendations.
 
 ### Cite as
 If you use **PtlBench** in your research or publications, please cite the following paper:  
