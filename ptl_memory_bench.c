@@ -4,7 +4,10 @@
 #include <sys/mman.h>
 #include <time.h>
 
+#define MAX_PING_PONG_BYTES (4 * 1024)
+
 static int table_output;
+static int stats_output;
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
@@ -84,6 +87,28 @@ get_operation(const ptl_handle_md_t md_h, const ptl_size_t offset,
   return eret;
 }
 
+static void
+output_samples(double* samples)
+{
+  if(stats_output)
+  {
+    report_stats(opts.msg_size, "latency",
+                 opts.pattern == PINGPONG ? "us (round trip)"
+                                          : "us (operation completion)",
+                 samples, opts.iterations);
+    return;
+  }
+
+  for(int i = 0; i < opts.iterations; ++i)
+    printf(table_output ? "%-9s %-10s %-5s %-6s %7i %14.4f\n"
+                        : "%s,%s,%s,%s,%i,%.4f\n",
+           opts.op == PUT ? "PtlPut" : "PtlGet",
+           opts.pattern == PINGPONG ? "ping_pong" : "one_sided",
+           opts.local_state == COLD ? "cold" : "hot",
+           opts.remote_state == COLD ? "cold" : "hot", opts.msg_size,
+           samples[i]);
+}
+
 void
 run_one_sided_benchmark()
 {
@@ -91,11 +116,12 @@ run_one_sided_benchmark()
   ptl_handle_md_t md_h;
   ptl_pt_index_t index;
   ptl_event_t event;
+  double* samples = rank == 0 ? alloc_samples(opts.iterations) : NULL;
   communicate = opts.op == PUT ? &put_operation : &get_operation;
 
   P4_CHECK(p4_pt_alloc(&ctx, &index));
 
-  if(0 == rank)
+  if(0 == rank && !stats_output)
   {
     // print header
     fprintf(stdout, table_output ? (opts.pattern == PINGPONG
@@ -144,14 +170,7 @@ run_one_sided_benchmark()
                      ? PTL_EVENT_PUT
                      : (opts.op == PUT ? PTL_EVENT_ACK : PTL_EVENT_REPLY),
                  &event);
-      double t = MPI_Wtime() - t0;
-      fprintf(stdout,
-              table_output ? "%-9s %-10s %-5s %-6s %7i %14.4f\n"
-                           : "%s,%s,%s,%s,%i,%.4f\n",
-              opts.op == PUT ? "PtlPut" : "PtlGet", "one_sided",
-              opts.local_state == COLD ? "cold" : "hot",
-              opts.remote_state == COLD ? "cold" : "hot", opts.msg_size,
-              t * 1e6);
+      samples[i] = (MPI_Wtime() - t0) * 1e6;
       p4_md_free(md_h);
     }
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -162,6 +181,9 @@ run_one_sided_benchmark()
     free_cold_pages(1);
   }
   p4_pt_free(&ctx, index);
+  if(rank == 0)
+    output_samples(samples);
+  free(samples);
 }
 
 void
@@ -171,13 +193,14 @@ run_ping_pong_benchmark()
   ptl_handle_md_t md_h;
   ptl_pt_index_t index;
   ptl_event_t event;
+  double* samples = rank == 0 ? alloc_samples(opts.iterations) : NULL;
   communicate = &put_operation;
 
   P4_CHECK(p4_pt_alloc(&ctx, &index));
 
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-  if(0 == rank)
+  if(0 == rank && !stats_output)
   {
     // print header
     fprintf(stdout, table_output ? (opts.pattern == PINGPONG
@@ -199,7 +222,14 @@ run_ping_pong_benchmark()
     {
       touch_cold_pages(1);
     }
-    P4_CHECK(p4_md_alloc_eq(&ctx, &md_h, page_buffer[0], page_size));
+    ptl_md_t md = {.start = page_buffer[0],
+                   .length = page_size,
+                   .options = PTL_MD_EVENT_SEND_DISABLE | PTL_MD_EVENT_CT_SEND,
+                   .ct_handle = ctx.ct_h,
+                   .eq_handle = ctx.eq_h};
+    if((ptl_size_t)opts.msg_size <= ctx.limits.max_volatile_size)
+      md.options |= PTL_MD_VOLATILE;
+    P4_CHECK(PtlMDBind(ctx.ni_h, &md, &md_h));
     if(0 == rank && HOT == opts.local_state)
     {
       touch_cold_pages(1);
@@ -222,13 +252,7 @@ run_ping_pong_benchmark()
                      : (opts.op == PUT ? PTL_EVENT_ACK : PTL_EVENT_REPLY),
                  &event);
 
-      double t = MPI_Wtime() - t0;
-      fprintf(stdout,
-              table_output ? "%-9s %-10s %-5s %-6s %7i %14.4f\n"
-                           : "%s,%s,%s,%s,%i,%.4f\n",
-              "PtlPut", "ping_pong", opts.local_state == COLD ? "cold" : "hot",
-              opts.remote_state == COLD ? "cold" : "hot", opts.msg_size,
-              t * 1e6);
+      samples[i] = (MPI_Wtime() - t0) * 1e6;
     }
     else
     {
@@ -241,12 +265,18 @@ run_ping_pong_benchmark()
       P4_CHECK(communicate(md_h, event.remote_offset, index, PTL_NO_ACK_REQ));
     }
 
+    // The responder sends only after the request PUT completes at the target.
+    // Drain local SEND completion separately before releasing the descriptor.
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    wait_count(ctx.ct_h, (ptl_size_t)i + 1);
     p4_md_free(md_h);
     p4_le_remove(le_h);
     free_cold_pages(1);
   }
   p4_pt_free(&ctx, index);
+  if(rank == 0)
+    output_samples(samples);
+  free(samples);
 }
 
 void
@@ -255,7 +285,7 @@ print_help_message()
   printf("Usage: ptl_memory_bench [options]\n");
   printf("Options:\n");
   printf("  -g, --get                 One-sided GET instead of PUT\n");
-  printf("  -p, --ping_pong           PUT ping-pong (reports RTT)\n");
+  printf("  -p, --ping_pong           PUT ping-pong (RTT, up to 4 KiB)\n");
   printf("  --seed N                  Random offset seed (default 1)\n");
   printf("  --table                   Human-readable output (default "
          "CSV)\n");
@@ -270,6 +300,7 @@ print_help_message()
          "argument)\n");
   printf("  -h, --help                Display this help message (no "
          "argument)\n");
+  puts("  --stats                   Report mean, median, min and max as CSV");
 }
 
 int
@@ -287,6 +318,7 @@ main(int argc, char* argv[])
       {"msg_size", required_argument, NULL, 'm'},
       {"ping_pong", no_argument, NULL, 'p'},
       {"table", no_argument, NULL, 1000},
+      {"stats", no_argument, NULL, BENCH_STATS_OPTION},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0}};
 
@@ -336,6 +368,9 @@ main(int argc, char* argv[])
     case 1000:
       table_output = 1;
       break;
+    case BENCH_STATS_OPTION:
+      stats_output = 1;
+      break;
     case 'h':
       print_help_message();
       exit(EXIT_SUCCESS);
@@ -351,7 +386,11 @@ main(int argc, char* argv[])
   int name_len;
   if(optind != argc)
     option_error("Unexpected positional argument");
+  if(stats_output && table_output)
+    option_error("Choose either --stats or --table");
   validate_iterations(opts.iterations, opts.warmup);
+  if(opts.pattern == PINGPONG && opts.msg_size > MAX_PING_PONG_BYTES)
+    option_error("Memory ping-pong message size must be at most 4096 bytes");
   long system_page_size = sysconf(_SC_PAGESIZE);
   if(system_page_size <= 0 || opts.msg_size <= 0 ||
      opts.msg_size > system_page_size)
@@ -371,6 +410,7 @@ main(int argc, char* argv[])
 
   fprintf(stderr, "Proc %i on %s\n", rank, processor_name);
 
+  configure_cache_pids(-1);
   P4_CHECK(PtlInit());
   eret = init_p4_ctx(&ctx, NON_MATCHING);
   if(PTL_OK != eret)
@@ -388,13 +428,6 @@ main(int argc, char* argv[])
 
   page_size = (size_t)system_page_size;
   check_message_size(&ctx, opts.msg_size);
-  if(opts.pattern == PINGPONG &&
-     (size_t)opts.msg_size > ctx.limits.max_volatile_size)
-  {
-    fprintf(stderr, "rank %d: NI max_volatile_size=%llu, requested=%d\n", rank,
-            (unsigned long long)ctx.limits.max_volatile_size, opts.msg_size);
-    bench_fail("Shared-page ping-pong requires size <= NI max_volatile_size");
-  }
 
   page_buffer = malloc(sizeof(void*));
   if(NULL == page_buffer)
@@ -412,6 +445,9 @@ main(int argc, char* argv[])
             opts.local_state == HOT ? "hot" : "cold",
             opts.remote_state == HOT ? "hot" : "cold", opts.cache_size,
             page_size, seed);
+
+  if(rank == 0 && stats_output)
+    puts(BENCH_STATS_HEADER);
 
   if(ONE_SIDED == opts.pattern)
     run_one_sided_benchmark();

@@ -3,6 +3,7 @@
 #include "common.h"
 #include <portals4.h>
 
+#include "bench_stats.h"
 #include "options.h"
 
 #define MiB (1024UL * 1024UL)
@@ -15,6 +16,9 @@ void mpi_check(int rc, const char* call);
 #define MPI_CHECK(call) mpi_check((call), #call)
 void wait_event(ptl_handle_eq_t eq, ptl_event_kind_t kind, ptl_event_t* event);
 void wait_count(ptl_handle_ct_t ct, ptl_size_t threshold);
+double* alloc_samples(size_t count);
+void report_stats(size_t size, const char* metric, const char* unit,
+                  double* samples, size_t count);
 void validate_buffer(const void* buffer, size_t bytes, unsigned char expected);
 void check_message_size(const p4_ctx_t* ctx, size_t size);
 
@@ -52,5 +56,5 @@ int p4_le_insert_ct_comm(p4_ctx_t* const ctx, ptl_handle_le_t* const le_h,
                          const ptl_pt_index_t index);
 int p4_md_alloc_eq_empty(p4_ctx_t* const ctx, ptl_handle_md_t* const md_h);
 void invalidate_cache(int* const cache_buffer, const size_t elements);
-int set_cache_regions(const int pids);
+void configure_cache_pids(int requested);
 #endif

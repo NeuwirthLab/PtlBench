@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 static int table_output;
+static int stats_output;
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
@@ -34,7 +35,7 @@ run_triggered_ping_pong_benchmark()
     P4_CHECK(eret);
   }
 
-  if(0 == rank)
+  if(0 == rank && !stats_output)
   {
     fprintf(stdout, table_output ? "Sample  Operation              Bytes       "
                                    "RTT (us)     Setup (us)\n"
@@ -102,12 +103,22 @@ run_triggered_ping_pong_benchmark()
 
   if(0 == rank)
   {
-    for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
+    if(stats_output)
     {
-      fprintf(stdout,
-              table_output ? "%6i  PtlTriggeredPut  %10zu %14.4f %14.4f\n"
-                           : "%i,PtlTriggeredPut,%zu,%.4f,%.4f\n",
-              i - opts.warmup, opts.msg_size, rtt[i], setup[i]);
+      report_stats(opts.msg_size, "rtt", "us (round trip)", rtt + opts.warmup,
+                   opts.iterations);
+      report_stats(opts.msg_size, "setup_time", "us (trigger registration)",
+                   setup + opts.warmup, opts.iterations);
+    }
+    else
+    {
+      for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
+      {
+        fprintf(stdout,
+                table_output ? "%6i  PtlTriggeredPut  %10zu %14.4f %14.4f\n"
+                             : "%i,PtlTriggeredPut,%zu,%.4f,%.4f\n",
+                i - opts.warmup, opts.msg_size, rtt[i], setup[i]);
+      }
     }
   }
 
@@ -147,7 +158,7 @@ run_ping_pong_benchmark()
     P4_CHECK(eret);
   }
 
-  if(0 == rank)
+  if(0 == rank && !stats_output)
   {
     fprintf(stdout,
             table_output
@@ -204,12 +215,20 @@ run_ping_pong_benchmark()
 
   if(0 == rank)
   {
-    for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
+    if(stats_output)
     {
-      fprintf(stdout,
-              table_output ? "%6i  PtlPut           %10zu %14.4f\n"
-                           : "%i,PtlPut,%zu,%.4f\n",
-              i - opts.warmup, opts.msg_size, time[i]);
+      report_stats(opts.msg_size, "rtt", "us (round trip)", time + opts.warmup,
+                   opts.iterations);
+    }
+    else
+    {
+      for(int i = opts.warmup; i < opts.iterations + opts.warmup; ++i)
+      {
+        fprintf(stdout,
+                table_output ? "%6i  PtlPut           %10zu %14.4f\n"
+                             : "%i,PtlPut,%zu,%.4f\n",
+                i - opts.warmup, opts.msg_size, time[i]);
+      }
     }
   }
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -238,6 +257,7 @@ print_help_message()
   printf("  -m, --msg_size <arg>      Specify the message size in bytes "
          "(required argument).\n");
   printf("  -h, --help                Display this help message and exit.\n");
+  puts("  --stats                   Report mean, median, min and max as CSV");
 }
 
 int
@@ -250,6 +270,7 @@ main(int argc, char* argv[])
       {"msg_size", required_argument, NULL, 'm'},
       {"triggered", no_argument, NULL, 't'},
       {"table", no_argument, NULL, 1000},
+      {"stats", no_argument, NULL, BENCH_STATS_OPTION},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0}};
 
@@ -285,6 +306,9 @@ main(int argc, char* argv[])
     case 1000:
       table_output = 1;
       break;
+    case BENCH_STATS_OPTION:
+      stats_output = 1;
+      break;
     case 'h':
       print_help_message();
       exit(EXIT_SUCCESS);
@@ -300,6 +324,8 @@ main(int argc, char* argv[])
   int name_len;
   if(optind != argc)
     option_error("Unexpected positional argument");
+  if(stats_output && table_output)
+    option_error("Choose either --stats or --table");
   validate_iterations(opts.iterations, opts.warmup);
   validate_range(opts.msg_size, opts.msg_size, 1);
   MPI_CHECK(MPI_Init(&argc, &argv));
@@ -312,6 +338,7 @@ main(int argc, char* argv[])
     bench_fail("Benchmark requires exactly two processes");
   }
 
+  configure_cache_pids(-1);
   P4_CHECK(PtlInit());
   eret = init_p4_ctx(&ctx, NON_MATCHING);
   if(PTL_OK != eret)
@@ -335,6 +362,9 @@ main(int argc, char* argv[])
             "bytes=%zu window=1 iterations=%d warmup=%d; RTT and "
             "trigger setup in us; initialized separate send/receive buffers\n",
             triggered, opts.msg_size, opts.iterations, opts.warmup);
+
+  if(rank == 0 && stats_output)
+    puts(BENCH_STATS_HEADER);
 
   if(triggered)
     run_triggered_ping_pong_benchmark();

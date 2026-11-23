@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 static int table_output;
+static int stats_output;
 static int rank;
 static int num_ranks;
 static p4_ctx_t ctx;
@@ -133,7 +134,7 @@ run_me_non_persistent_benchmark()
   ptl_handle_md_t md_h;
   ptl_pt_index_t index;
   int eret = -1;
-  double t0 = 0.0, t;
+  double t0 = 0.0;
   cmd_ctx_t cmd;
 
   ptl_handle_me_t* me_hs = NULL;
@@ -151,6 +152,8 @@ run_me_non_persistent_benchmark()
 
   communicate = opts.op == PUT ? &put_operation : &get_operation;
   int iterations = opts.iterations + opts.warmup;
+  double* bandwidth = rank == 0 ? alloc_samples(opts.iterations) : NULL;
+  double* latency = rank == 0 ? alloc_samples(opts.iterations) : NULL;
 
   me_hs = malloc(opts.window_size * sizeof(ptl_handle_me_t));
   sizes = malloc(opts.window_size * sizeof(ptl_size_t));
@@ -158,7 +161,7 @@ run_me_non_persistent_benchmark()
   if(!me_hs || !sizes || !buffers)
     bench_fail("Window allocation failed");
 
-  if(0 == rank)
+  if(0 == rank && !stats_output)
   {
     fprintf(stdout,
             table_output
@@ -218,20 +221,35 @@ run_me_non_persistent_benchmark()
 
         if(i >= opts.warmup)
         {
-          t = MPI_Wtime() - t0;
-          fprintf(stdout,
-                  table_output ? "%-9s %8i %10zu %12.4f %12.4f\n"
-                               : "%s,%i,%zu,%.4f,%.4f\n",
-                  opts.op == PUT ? "put" : "get", opts.window_size, msg_size,
-                  (msg_size * opts.window_size * 1e-6) / t,
-                  (t * 1e6) / opts.window_size);
-          fflush(stdout);
+          latency[i - opts.warmup] = MPI_Wtime() - t0;
         }
       }
       p4_md_free(md_h);
       if(opts.op == GET)
         validate_buffer(send_buffer, msg_size * opts.window_size, 'd');
       free(send_buffer);
+      for(int i = 0; i < opts.iterations; ++i)
+      {
+        double elapsed = latency[i];
+        bandwidth[i] = (msg_size * opts.window_size * 1e-6) / elapsed;
+        latency[i] = (elapsed * 1e6) / opts.window_size;
+      }
+      if(stats_output)
+      {
+        report_stats(msg_size, "bandwidth", "MB/s (decimal)", bandwidth,
+                     opts.iterations);
+        report_stats(msg_size, "latency", "us/operation (window time / window)",
+                     latency, opts.iterations);
+      }
+      else
+      {
+        for(int i = 0; i < opts.iterations; ++i)
+          printf(table_output ? "%-9s %8i %10zu %12.4f %12.4f\n"
+                              : "%s,%i,%zu,%.4f,%.4f\n",
+                 opts.op == PUT ? "put" : "get", opts.window_size, msg_size,
+                 bandwidth[i], latency[i]);
+      }
+      fflush(stdout);
     }
     else
     {
@@ -253,6 +271,8 @@ run_me_non_persistent_benchmark()
 
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
+  free(bandwidth);
+  free(latency);
   free(me_hs);
   free(buffers);
   free(sizes);
@@ -272,6 +292,7 @@ print_help_message(void)
       "  -g, --get            GET instead of PUT\n"
       "  --table              Human-readable output (default CSV)\n"
       "  -h, --help           Show help\n");
+  puts("  --stats                   Report mean, median, min and max as CSV");
 }
 
 int
@@ -285,6 +306,7 @@ main(int argc, char* argv[])
       {"window-size", required_argument, NULL, 'w'},
       {"get", no_argument, NULL, 'g'},
       {"table", no_argument, NULL, 1000},
+      {"stats", no_argument, NULL, BENCH_STATS_OPTION},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0}};
 
@@ -330,6 +352,9 @@ main(int argc, char* argv[])
     case 1000:
       table_output = 1;
       break;
+    case BENCH_STATS_OPTION:
+      stats_output = 1;
+      break;
     case 'h':
       print_help_message();
       exit(EXIT_SUCCESS);
@@ -345,6 +370,8 @@ main(int argc, char* argv[])
   int name_len;
   if(optind != argc)
     option_error("Unexpected positional argument");
+  if(stats_output && table_output)
+    option_error("Choose either --stats or --table");
   validate_iterations(opts.iterations, opts.warmup);
   validate_range(opts.min_msg_size, opts.max_msg_size, opts.window_size);
   if(opts.window_size > 4096)
@@ -359,6 +386,7 @@ main(int argc, char* argv[])
     bench_fail("Benchmark requires exactly two processes");
   }
 
+  configure_cache_pids(-1);
   P4_CHECK(PtlInit());
   eret = init_p4_ctx(&ctx, MATCHING);
   if(PTL_OK != eret)
@@ -388,6 +416,9 @@ main(int argc, char* argv[])
             "includes command readiness and entry setup wait\n",
             opts.op == PUT ? "put" : "get", opts.window_size, opts.iterations,
             opts.warmup, opts.min_msg_size, opts.max_msg_size);
+
+  if(rank == 0 && stats_output)
+    puts(BENCH_STATS_HEADER);
 
   run_me_non_persistent_benchmark();
   destroy_p4_ctx(&ctx);

@@ -60,6 +60,23 @@ wait_count(ptl_handle_ct_t ct, ptl_size_t threshold)
     bench_fail("Counting event reports failed or incomplete operations");
 }
 
+double*
+alloc_samples(size_t count)
+{
+  double* samples = malloc(count * sizeof(*samples));
+  if(samples == NULL)
+    bench_fail("Sample allocation failed");
+  return samples;
+}
+
+void
+report_stats(size_t size, const char* metric, const char* unit, double* samples,
+             size_t count)
+{
+  if(bench_print_stats(size, metric, unit, samples, count) != 0)
+    bench_fail("Could not write statistics");
+}
+
 void
 validate_buffer(const void* buffer, size_t bytes, unsigned char expected)
 {
@@ -430,23 +447,56 @@ invalidate_cache(int* const cache_buffer, const size_t elements)
   }
 }
 
-int
-set_cache_regions(const int pids)
+static const char cache_pids_path[] = "/sys/class/bxi/bxi0/v2p/cache_pids";
+
+static int
+read_cache_pids(void)
 {
-  FILE* fptr;
-
-  fptr = fopen("/sys/class/bxi/bxi0/v2p/cache_pids", "w");
-
-  if(fptr == NULL)
-  {
-    perror("BXI cache_pids");
+  FILE* file = fopen(cache_pids_path, "r");
+  if(file == NULL)
     return -1;
+  int value;
+  int fields = fscanf(file, "%d", &value);
+  int status = fclose(file);
+  return fields == 1 && status == 0 ? value : -1;
+}
+
+void
+configure_cache_pids(int requested)
+{
+  if(requested < 0)
+  {
+    const char* setting = getenv("PTLBENCH_CACHE_PIDS");
+    if(setting == NULL)
+      return;
+    requested = parse_int(setting);
   }
 
-  if(fprintf(fptr, "%i", pids) < 0)
+  // An already configured NIC can be used without sysfs write permissions.
+  if(read_cache_pids() != requested)
   {
-    fclose(fptr);
-    return -1;
+    FILE* file = fopen(cache_pids_path, "w");
+    if(file == NULL)
+    {
+      perror(cache_pids_path);
+      char message[128];
+      snprintf(message, sizeof(message), "Cannot set BXI cache_pids=%d",
+               requested);
+      bench_fail(message);
+    }
+    int written = fprintf(file, "%d", requested);
+    int status = fclose(file);
+    if(written < 0 || status != 0)
+    {
+      perror(cache_pids_path);
+      bench_fail("Cannot write BXI cache_pids");
+    }
   }
-  return fclose(fptr);
+  // Complete host-side setup on both ranks before either initializes Portals.
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  if(read_cache_pids() != requested)
+    bench_fail("BXI cache_pids readback differs from the requested value");
+  int rank;
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+  fprintf(stderr, "rank %d: BXI cache_pids=%d\n", rank, requested);
 }

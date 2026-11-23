@@ -3,10 +3,12 @@
 #include <getopt.h>
 
 static int table_output;
+static int stats_output;
 static int rank;
 static int num_ranks;
 static benchmark_opts_t opts;
 static p4_ctx_t ctx;
+static double* samples;
 
 int* cache_buffer;
 size_t cache_buffer_size;
@@ -25,6 +27,33 @@ wait_for_completion(const ptl_size_t wait_for)
   }
 }
 
+static void
+output_samples(size_t msg_size)
+{
+  for(int i = 0; i < opts.iterations; ++i)
+    samples[i] = opts.type == LATENCY
+                     ? samples[i] * 1e6
+                     : (msg_size * opts.window_size * 1e-6) / samples[i];
+
+  if(stats_output)
+  {
+    if(opts.type == LATENCY)
+      report_stats(msg_size, "latency", "us (operation completion)", samples,
+                   opts.iterations);
+    else
+      report_stats(msg_size, "bandwidth", "MB/s (decimal)", samples,
+                   opts.iterations);
+  }
+  else
+  {
+    const char* op = opts.op == PUT ? "put" : "get";
+    for(int i = 0; i < opts.iterations; ++i)
+      printf(table_output ? "%s     %10zu    %16.4f\n" : "%s,%zu,%.4f\n", op,
+             msg_size, samples[i]);
+  }
+  fflush(stdout);
+}
+
 int
 p4_put_latency()
 {
@@ -35,7 +64,7 @@ p4_put_latency()
   ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
   void* buffer = NULL;
-  double t0 = 0.0, t;
+  double t0 = 0.0;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
@@ -43,7 +72,7 @@ p4_put_latency()
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
 
   // print header
-  if(0 == rank)
+  if(0 == rank && !stats_output)
     fprintf(stdout, table_output ? "Operation    Bytes    Completion (us)\n"
                                  : "func,msg_size,latency\n");
 
@@ -103,11 +132,7 @@ p4_put_latency()
 
         if(i >= opts.warmup)
         {
-          t = MPI_Wtime() - t0;
-          fprintf(stdout,
-                  table_output ? "put     %10zu    %16.4f\n" : "put,%zu,%.4f\n",
-                  msg_size, t * 1e6);
-          fflush(stdout);
+          samples[i - opts.warmup] = MPI_Wtime() - t0;
         }
       }
       if(0 == rank && COUNTING == opts.event_type)
@@ -129,6 +154,8 @@ p4_put_latency()
     if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
       validate_buffer(buffer, msg_size, opts.op == PUT ? 'c' : 'd');
     free(buffer);
+    if(rank == 0)
+      output_samples(msg_size);
   }
   p4_pt_free(&ctx, index);
   return 0;
@@ -144,14 +171,14 @@ p4_get_latency()
   ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
   void* buffer = NULL;
-  double t0 = 0.0, t;
+  double t0 = 0.0;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
     P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
-  if(0 == rank)
+  if(0 == rank && !stats_output)
     fprintf(stdout, table_output ? "Operation    Bytes    Completion (us)\n"
                                  : "func,msg_size,latency\n");
 
@@ -207,11 +234,7 @@ p4_get_latency()
 
         if(i >= opts.warmup)
         {
-          t = MPI_Wtime() - t0;
-          fprintf(stdout,
-                  table_output ? "get     %10zu    %16.4f\n" : "get,%zu,%.4f\n",
-                  msg_size, t * 1e6);
-          fflush(stdout);
+          samples[i - opts.warmup] = MPI_Wtime() - t0;
         }
       }
       if(0 == rank && COUNTING == opts.event_type)
@@ -233,6 +256,8 @@ p4_get_latency()
     if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
       validate_buffer(buffer, msg_size, opts.op == PUT ? 'c' : 'd');
     free(buffer);
+    if(rank == 0)
+      output_samples(msg_size);
   }
   p4_pt_free(&ctx, index);
   return 0;
@@ -249,14 +274,14 @@ p4_put_bandwidth()
   ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
   void* buffer = NULL;
-  double t0 = 0.0, t;
+  double t0 = 0.0;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
     P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
-  if(0 == rank)
+  if(0 == rank && !stats_output)
     fprintf(stdout, table_output ? "Operation    Bytes    Bandwidth (MB/s)\n"
                                  : "func,msg_size,bandwidth\n");
 
@@ -318,11 +343,7 @@ p4_put_bandwidth()
 
         if(i >= opts.warmup)
         {
-          t = MPI_Wtime() - t0;
-          fprintf(stdout,
-                  table_output ? "put     %10zu    %16.4f\n" : "put,%zu,%.4f\n",
-                  msg_size, (msg_size * opts.window_size * 1e-6) / t);
-          fflush(stdout);
+          samples[i - opts.warmup] = MPI_Wtime() - t0;
         }
         if(0 == rank && COUNTING == opts.event_type)
         {
@@ -344,6 +365,8 @@ p4_put_bandwidth()
     if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
       validate_buffer(buffer, bytes, opts.op == PUT ? 'c' : 'd');
     free(buffer);
+    if(rank == 0)
+      output_samples(msg_size);
   }
   p4_pt_free(&ctx, index);
   return 0;
@@ -360,14 +383,14 @@ p4_get_bandwidth()
   ptl_pt_index_t index;
   ptl_ct_event_t zero = {.success = 0, .failure = 0};
   void* buffer = NULL;
-  double t0 = 0.0, t;
+  double t0 = 0.0;
 
   eret = p4_pt_alloc(&ctx, &index);
   if(PTL_OK != eret)
     P4_CHECK(eret);
   ptl_match_bits_t match_bits = opts.ni_mode == MATCHING ? 0xDEADBEEF : 0;
   // print header
-  if(0 == rank)
+  if(0 == rank && !stats_output)
     fprintf(stdout, table_output ? "Operation    Bytes    Bandwidth (MB/s)\n"
                                  : "func,msg_size,bandwidth\n");
 
@@ -427,11 +450,7 @@ p4_get_bandwidth()
 
         if(i >= opts.warmup)
         {
-          t = MPI_Wtime() - t0;
-          fprintf(stdout,
-                  table_output ? "get     %10zu    %16.4f\n" : "get,%zu,%.4f\n",
-                  msg_size, (msg_size * opts.window_size * 1e-6) / t);
-          fflush(stdout);
+          samples[i - opts.warmup] = MPI_Wtime() - t0;
         }
 
         if(0 == rank && COUNTING == opts.event_type)
@@ -454,6 +473,8 @@ p4_get_bandwidth()
     if((opts.op == PUT && rank == 1) || (opts.op == GET && rank == 0))
       validate_buffer(buffer, bytes, opts.op == PUT ? 'c' : 'd');
     free(buffer);
+    if(rank == 0)
+      output_samples(msg_size);
   }
   p4_pt_free(&ctx, index);
   return 0;
@@ -504,6 +525,7 @@ print_help_message()
   printf("  -p, --pids <value>             Set BXI cache regions "
          "(site-specific)\n");
   fflush(stdout);
+  puts("  --stats                   Report mean, median, min and max as CSV");
 }
 
 void
@@ -550,6 +572,7 @@ main(int argc, char* argv[])
       {"full", no_argument, NULL, 'f'},
       {"pids", required_argument, NULL, 'p'},
       {"table", no_argument, NULL, 1000},
+      {"stats", no_argument, NULL, BENCH_STATS_OPTION},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0}};
 
@@ -621,6 +644,9 @@ main(int argc, char* argv[])
     case 1000:
       table_output = 1;
       break;
+    case BENCH_STATS_OPTION:
+      stats_output = 1;
+      break;
     case 'h':
       print_help_message();
       exit(EXIT_SUCCESS);
@@ -635,6 +661,8 @@ main(int argc, char* argv[])
 
   if(optind != argc)
     option_error("Unexpected positional argument");
+  if(stats_output && table_output)
+    option_error("Choose either --stats or --table");
   validate_iterations(opts.iterations, opts.warmup);
   validate_range(opts.min_msg_size, opts.max_msg_size, opts.window_size);
   if(opts.event_type == FULL && opts.window_size > 4096)
@@ -649,8 +677,7 @@ main(int argc, char* argv[])
     bench_fail("Benchmark failed; see preceding diagnostic");
   }
 
-  if(cache_regions >= 0 && set_cache_regions(cache_regions) != 0)
-    bench_fail("Cannot configure BXI cache regions");
+  configure_cache_pids(cache_regions);
 
   if(0 == rank)
     print_benchmark_opts();
@@ -679,6 +706,13 @@ main(int argc, char* argv[])
     bench_fail("Benchmark initialization failed");
   }
 
+  if(rank == 0)
+  {
+    samples = alloc_samples(opts.iterations);
+    if(stats_output)
+      puts(BENCH_STATS_HEADER);
+  }
+
   if(LATENCY == opts.type)
   {
     if(opts.op == PUT)
@@ -703,6 +737,7 @@ main(int argc, char* argv[])
   }
 
   P4_CHECK(eret);
+  free(samples);
   free(cache_buffer);
   destroy_p4_ctx(&ctx);
   PtlFini();

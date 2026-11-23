@@ -1,4 +1,5 @@
-#include "include/options.h"
+#include "bench_stats.h"
+#include "options.h"
 #include <getopt.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -20,12 +21,14 @@ int
 main(int argc, char* argv[])
 {
   int iterations = 10000, warmup = 100, table = 0, result = EXIT_FAILURE;
+  int stats = 0;
   unsigned int seed = 1;
   static const struct option options[] = {
       {"iterations", required_argument, NULL, 'i'},
       {"warmup", required_argument, NULL, 'w'},
       {"seed", required_argument, NULL, 's'},
       {"table", no_argument, NULL, 't'},
+      {"stats", no_argument, NULL, BENCH_STATS_OPTION},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0}};
   int opt;
@@ -45,8 +48,12 @@ main(int argc, char* argv[])
     case 't':
       table = 1;
       break;
+    case BENCH_STATS_OPTION:
+      stats = 1;
+      break;
     case 'h':
-      puts("Usage: pf_bench [-i iterations] [-w warmup] [--seed N] [--table]\n"
+      puts("Usage: pf_bench [-i iterations] [-w warmup] [--seed N] [--table | "
+           "--stats]\n"
            "Defaults: 10000 iterations, 100 warmup, seed 1; CSV time in ns");
       return EXIT_SUCCESS;
     default:
@@ -55,6 +62,8 @@ main(int argc, char* argv[])
   }
   if(optind != argc)
     option_error("Unexpected positional argument");
+  if(stats && table)
+    option_error("Choose either --stats or --table");
   validate_iterations(iterations, warmup);
   int pages = iterations + warmup;
   long system_page_size = sysconf(_SC_PAGESIZE);
@@ -66,7 +75,8 @@ main(int argc, char* argv[])
   void** page_buffer = calloc((size_t)pages, sizeof(void*));
   size_t cache_bytes = 16UL * 1024 * 1024;
   int* cache_buffer = malloc(cache_bytes);
-  if(!page_buffer || !cache_buffer)
+  double* samples = malloc((size_t)iterations * sizeof(*samples));
+  if(!page_buffer || !cache_buffer || !samples)
   {
     fprintf(stderr, "Allocation failed\n");
     goto end;
@@ -87,7 +97,6 @@ main(int argc, char* argv[])
           "iterations=%d warmup=%d page_bytes=%zu seed=%u "
           "cache_sweep_bytes=%zu; first store time in ns\n",
           iterations, warmup, page_size, seed, cache_bytes);
-  puts(table ? "Sample       First store (ns)" : "count,time");
   for(int i = 0; i < pages; ++i)
   {
     volatile int* page = page_buffer[i];
@@ -100,7 +109,23 @@ main(int argc, char* argv[])
     page[offset] = 0x92;
     double t = wtime() - t0;
     if(i >= warmup)
-      printf(table ? "%6d %22.6f\n" : "%i,%.6f\n", i, t);
+      samples[i - warmup] = t;
+  }
+  if(stats)
+  {
+    if(puts(BENCH_STATS_HEADER) == EOF ||
+       bench_print_stats(0, "time", "ns (first CPU store)", samples,
+                         iterations) != 0)
+    {
+      fprintf(stderr, "Could not write statistics\n");
+      goto end;
+    }
+  }
+  else
+  {
+    puts(table ? "Sample       First store (ns)" : "count,time");
+    for(int i = 0; i < iterations; ++i)
+      printf(table ? "%6d %22.6f\n" : "%i,%.6f\n", warmup + i, samples[i]);
   }
   result = EXIT_SUCCESS;
 end:
@@ -110,6 +135,7 @@ end:
       perror("munmap");
       result = EXIT_FAILURE;
     }
+  free(samples);
   free(page_buffer);
   free(cache_buffer);
   return result;
